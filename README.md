@@ -1,5 +1,11 @@
 # Music Assistant BridgeThing
 
+
+<img width="4000" height="3000" alt="PXL_20260725_224155920" src="https://github.com/user-attachments/assets/7a5a8ed7-ad05-40df-966d-515caf53f7be" />
+
+<img width="4000" height="3000" alt="PXL_20260725_224137793 MP" src="https://github.com/user-attachments/assets/5388a7c3-02a6-4ba8-942a-266d91ef7b6d" />
+
+
 A BridgeThing webapp for controlling Music Assistant from a Spotify Car Thing.
 
 The app runs on BridgeThing firmware and is configured from the BridgeThing
