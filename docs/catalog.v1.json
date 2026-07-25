@@ -1,6 +1,6 @@
 {
   "schema": "catalog.v1",
-  "updated_at": "2026-07-25T22:14:11Z",
+  "updated_at": "2026-07-25T22:30:00Z",
   "repo": {
     "name": "Music Assistant BridgeThing",
     "description": "BridgeThing apps for Music Assistant.",
@@ -9,7 +9,7 @@
   },
   "apps": [
     {
-      "id": "4dad5a00-d2a0-4cd7-9486-34b2d040d6f6",
+      "id": "019f9b5e-7cea-7866-8086-d8ba20311b32",
       "name": "Music Assistant",
       "description": "Music Assistant controller for BridgeThing.",
       "author": "nwo122383",
@@ -19,11 +19,11 @@
       "versions": [
         {
           "version": "0.1.0",
-          "released_at": "2026-07-25T22:14:11Z",
+          "released_at": "2026-07-25T22:30:00Z",
           "download": {
             "url": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/music-assistant-bridgething-v0.1.0.zip",
-            "size": 168457,
-            "sha256": "0046ebdb803d3ac4349c3ab6b4a1ce63c178f4fca980ec8eff7529a8dff08a28"
+            "size": 168458,
+            "sha256": "25576e31d6cca7e8603af2de51d7714292f790284c7383143ee1af29da214ab1"
           },
           "permissions": ["net.ws", "net.proxy"],
           "min_libbridgething_version": "12.0.0",
