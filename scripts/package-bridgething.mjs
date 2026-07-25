@@ -6,7 +6,8 @@ import packageJson from "../package.json" with { type: "json" };
 const root = new URL("..", import.meta.url).pathname;
 const distDir = join(root, "dist");
 const releaseDir = join(root, "release");
-const packageName = `${packageJson.name}-bridgething-v${packageJson.version}.zip`;
+const packageBase = packageJson.name.endsWith("-bridgething") ? packageJson.name : `${packageJson.name}-bridgething`;
+const packageName = `${packageBase}-v${packageJson.version}.zip`;
 const outputPath = join(releaseDir, packageName);
 
 const crcTable = new Uint32Array(256);
