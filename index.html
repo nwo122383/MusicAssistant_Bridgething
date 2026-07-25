@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#08090c" />
+    <title>Music Assistant</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      if (typeof globalThis === "undefined") window.globalThis = window;
+      if (!Promise.allSettled) {
+        Promise.allSettled = function (promises) {
+          return Promise.all(promises.map(function (promise) {
+            return Promise.resolve(promise).then(
+              function (value) { return { status: "fulfilled", value: value }; },
+              function (reason) { return { status: "rejected", reason: reason }; }
+            );
+          }));
+        };
+      }
+      if (!Object.fromEntries) {
+        Object.fromEntries = function (entries) {
+          var result = {};
+          entries.forEach(function (entry) { result[entry[0]] = entry[1]; });
+          return result;
+        };
+      }
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

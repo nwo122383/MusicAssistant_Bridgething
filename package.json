@@ -1,0 +1,37 @@
+{
+  "name": "carthing-music-assistant",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build && node scripts/transpile-chrome69.mjs",
+    "build:device": "tsc -b && vite build --mode carthing && node scripts/transpile-chrome69.mjs",
+    "build:bridgething": "tsc -b && vite build --mode bridgething && vite build -c vite.settings.config.ts",
+    "package:bridgething": "node scripts/package-bridgething.mjs",
+    "release:bridgething": "npm run build:bridgething && npm run package:bridgething",
+    "bridge": "node server/bridge.mjs",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@bridgething/client": "^0.4.0",
+    "@vitejs/plugin-react": "latest",
+    "express": "latest",
+    "http-proxy": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@testing-library/react": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "esbuild": "latest",
+    "jsdom": "latest",
+    "vite-plugin-singlefile": "^2.3.3",
+    "vitest": "latest"
+  }
+}

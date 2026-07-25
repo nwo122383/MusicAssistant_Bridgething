@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.carthing/
+release/
+.env*
+*.tsbuildinfo
+*.pyc
+__pycache__/
+bridgething-*.zip
+scratch/
+window_dump.xml
+tools/*.exe
+android-relay/.gradle/
+android-relay/build/
+android-relay/app/build/

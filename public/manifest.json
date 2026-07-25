@@ -1,0 +1,52 @@
+{
+  "id": "4dad5a00-d2a0-4cd7-9486-34b2d040d6f6",
+  "name": "Music Assistant",
+  "version": "0.1.0",
+  "description": "Music Assistant controller for BridgeThing",
+  "icon": null,
+  "settings": "settings.html",
+  "role": "standard",
+  "config": [
+    {
+      "type": "string",
+      "data": {
+        "key": "serverUrl",
+        "label": "Server URL",
+        "pattern": "^https?://.+",
+        "minLength": 8,
+        "maxLength": 256,
+        "default": null
+      }
+    },
+    {
+      "type": "secret",
+      "data": {
+        "key": "token",
+        "label": "Access token",
+        "pattern": null,
+        "minLength": null,
+        "maxLength": 2048,
+        "default": null
+      }
+    },
+    {
+      "type": "enum",
+      "data": {
+        "key": "transport",
+        "label": "Connection path",
+        "choices": ["homeassistant", "bridgething", "direct"],
+        "default": "bridgething"
+      }
+    }
+  ],
+  "permissions": ["net.ws", "net.proxy"],
+  "voiceGrammar": null,
+  "art": { "heroPx": 256, "thumbPx": 128 },
+  "overlays": {
+    "notifications": true,
+    "call": true,
+    "pairing": true,
+    "connection": true,
+    "volume": false
+  }
+}
