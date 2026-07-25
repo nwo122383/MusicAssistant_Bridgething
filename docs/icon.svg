@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Music Assistant">
+  <rect width="128" height="128" rx="24" fill="#101318"/>
+  <circle cx="64" cy="64" r="48" fill="#1f2a24"/>
+  <path d="M52 38v46.5a13.5 13.5 0 1 1-8-12.3V48l38-8v36.5a13.5 13.5 0 1 1-8-12.3V50.1L52 54.7V38z" fill="#65e6a7"/>
+</svg>
