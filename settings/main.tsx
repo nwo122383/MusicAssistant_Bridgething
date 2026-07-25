@@ -47,9 +47,9 @@ function urlLabel(transport: Values["transport"]): string {
 }
 
 function urlPlaceholder(transport: Values["transport"]): string {
-  if (transport === "homeassistant") return "https://your-home.ui.nabu.casa";
+  if (transport === "homeassistant") return "https://home-assistant.example.com";
   if (transport === "bridgething") return "https://music.example.com";
-  return "http://192.168.1.10:8095";
+  return "http://music-assistant.local:8095";
 }
 
 function tokenLabel(transport: Values["transport"]): string {

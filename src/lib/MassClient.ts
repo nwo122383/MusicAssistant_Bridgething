@@ -34,6 +34,7 @@ export class MassClient {
   private haStates = new Map<string, HaState>();
   private haMassConfigEntryId = "";
   private haRefreshInFlight?: Promise<void>;
+  private haQueueHydrationSequence = new Map<string, number>();
 
   async connect(serverUrl: string, token?: string, transport: MassTransport = "direct"): Promise<void> {
     this.disconnect();
@@ -163,6 +164,7 @@ export class MassClient {
     this.socket = undefined;
     this.haStates.clear();
     this.haMassConfigEntryId = "";
+    this.haQueueHydrationSequence.clear();
     this.rejectPending(new Error("Connection replaced"));
   }
 
@@ -346,8 +348,10 @@ export class MassClient {
     if (message.event?.event_type !== "state_changed") return;
     const entity = message.event.data?.new_state;
     if (!entity?.entity_id?.startsWith("media_player.") || !this.shouldTrackHaState(entity)) return;
+    const previous = this.haStates.get(entity.entity_id);
     this.haStates.set(entity.entity_id, entity);
     this.emitHaState(entity);
+    if (this.haMediaIdentityChanged(previous, entity)) void this.emitHydratedHaQueue(entity.entity_id);
   }
 
   private async haCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -357,7 +361,7 @@ export class MassClient {
     }
     if (command === "player_queues/all") {
       await this.refreshHaTrackedStates();
-      return this.haQueues() as T;
+      return (await this.haQueues()) as T;
     }
     if (command === "player_queues/items") return (await this.haQueueItems(String(args?.queue_id || ""))) as T;
     if (command === "music/search") return (await this.haSearch(args)) as T;
@@ -384,8 +388,9 @@ export class MassClient {
     return this.haMediaStates().map((state) => this.haStateToPlayer(state));
   }
 
-  private haQueues(): PlayerQueue[] {
-    return this.haMediaStates().map((state) => this.haStateToQueue(state));
+  private async haQueues(): Promise<PlayerQueue[]> {
+    const queues = this.haMediaStates().map((state) => this.haStateToQueue(state));
+    return Promise.all(queues.map((queue) => this.hydrateHaQueue(queue).catch(() => queue)));
   }
 
   private haMediaStates(): HaState[] {
@@ -445,10 +450,12 @@ export class MassClient {
     const upserts = { ...(event.a ?? {}), ...(event.c ?? {}) };
     Object.entries(upserts).forEach(([entityId, compact]) => {
       if (!entityId.startsWith("media_player.")) return;
+      const previous = this.haStates.get(entityId);
       const state = this.expandHaCompactState(entityId, compact);
       if (!state || !this.shouldTrackHaState(state)) return;
       this.haStates.set(entityId, state);
       this.emitHaState(state);
+      if (this.haMediaIdentityChanged(previous, state)) void this.emitHydratedHaQueue(entityId);
     });
     const removed = Array.isArray(event.r) ? event.r : Object.keys(event.r ?? {});
     removed.forEach((entityId) => {
@@ -474,6 +481,18 @@ export class MassClient {
     this.eventListeners.forEach((listener) => {
       listener({ event: "player_updated", object_id: state.entity_id, data: this.haStateToPlayer(state) });
       listener({ event: "queue_updated", object_id: state.entity_id, data: this.haStateToQueue(state) });
+    });
+  }
+
+  private async emitHydratedHaQueue(entityId: string): Promise<void> {
+    const state = this.haStates.get(entityId);
+    if (!state) return;
+    const sequence = (this.haQueueHydrationSequence.get(entityId) ?? 0) + 1;
+    this.haQueueHydrationSequence.set(entityId, sequence);
+    const queue = await this.hydrateHaQueue(this.haStateToQueue(state));
+    if (this.haQueueHydrationSequence.get(entityId) !== sequence) return;
+    this.eventListeners.forEach((listener) => {
+      listener({ event: "queue_updated", object_id: entityId, data: queue });
     });
   }
 
@@ -517,12 +536,57 @@ export class MassClient {
     if (!queueId) return [];
     const response = await this.getHaQueue(queueId);
     const entry = this.extractHaQueueEntry(response, queueId);
-    const candidates =
+    return this.haQueueCandidates(entry)
+      .map((item: unknown, index: number) => this.normalizeHaQueueItem(item, index))
+      .filter(Boolean) as QueueItem[];
+  }
+
+  private async hydrateHaQueue(queue: PlayerQueue): Promise<PlayerQueue> {
+    const response = await this.getHaQueue(queue.queue_id);
+    const entry = this.extractHaQueueEntry(response, queue.queue_id);
+    if (!entry || typeof entry !== "object") return queue;
+    const record = entry as Record<string, any>;
+    const currentIndex = numberOrUndefined(
+      record.current_index ?? record.index_in_buffer ?? record.current_item_index ?? queue.current_index,
+    );
+    const candidates = this.haQueueCandidates(record);
+    const indexedItem = currentIndex !== undefined && currentIndex >= 0 ? candidates[currentIndex] : undefined;
+    const currentItem =
+      this.normalizeHaQueueItem(record.current_item ?? record.current ?? record.active_item ?? indexedItem, currentIndex ?? 0) ??
+      queue.current_item;
+    const nextItem =
+      this.normalizeHaQueueItem(record.next_item ?? candidates[(currentIndex ?? -1) + 1], (currentIndex ?? 0) + 1) ??
+      queue.next_item;
+    const elapsed = numberOrUndefined(record.elapsed_time ?? record.media_position ?? record.corrected_elapsed_time);
+    const elapsedUpdated =
+      numberOrUndefined(record.elapsed_time_last_updated) ??
+      dateSecondsOrUndefined(record.elapsed_time_last_updated) ??
+      dateSecondsOrUndefined(record.media_position_updated_at);
+    const repeat = record.repeat_mode ?? record.repeat;
+
+    return {
+      ...queue,
+      state: String(record.state ?? queue.state),
+      active: typeof record.active === "boolean" ? record.active : queue.active,
+      shuffle_enabled: typeof record.shuffle_enabled === "boolean" ? record.shuffle_enabled : queue.shuffle_enabled,
+      repeat_mode: repeat === "one" || repeat === "all" ? repeat : repeat === "off" ? "off" : queue.repeat_mode,
+      elapsed_time: elapsed ?? queue.elapsed_time,
+      elapsed_time_last_updated: elapsedUpdated ?? queue.elapsed_time_last_updated,
+      current_item: currentItem,
+      next_item: nextItem,
+      current_index: currentIndex ?? queue.current_index,
+      index_in_buffer: numberOrUndefined(record.index_in_buffer) ?? queue.index_in_buffer,
+      items: numberOrUndefined(record.items) ?? numberOrUndefined(record.queue_size) ?? (candidates.length || queue.items),
+    };
+  }
+
+  private haQueueCandidates(entry: any): unknown[] {
+    return (
       (Array.isArray(entry?.queue_items) && entry.queue_items) ||
       (Array.isArray(entry?.items) && entry.items) ||
       (Array.isArray(entry?.queue) && entry.queue) ||
-      [entry?.current_item, entry?.next_item].filter(Boolean);
-    return (candidates as unknown[]).map((item: unknown, index: number) => this.normalizeHaQueueItem(item, index)).filter(Boolean) as QueueItem[];
+      [entry?.current_item, entry?.next_item].filter(Boolean)
+    );
   }
 
   private async callHaPlayerCommand(playerId: string, action: string, args?: Record<string, unknown>): Promise<void> {
@@ -779,6 +843,22 @@ export class MassClient {
     };
   }
 
+  private haMediaIdentityChanged(previous: HaState | undefined, next: HaState): boolean {
+    if (!previous) return true;
+    const previousAttributes = previous.attributes;
+    const nextAttributes = next.attributes;
+    return (
+      previous.state !== next.state ||
+      previousAttributes.media_title !== nextAttributes.media_title ||
+      previousAttributes.media_artist !== nextAttributes.media_artist ||
+      previousAttributes.media_album_name !== nextAttributes.media_album_name ||
+      previousAttributes.media_content_id !== nextAttributes.media_content_id ||
+      previousAttributes.media_content_type !== nextAttributes.media_content_type ||
+      previousAttributes.media_duration !== nextAttributes.media_duration ||
+      previousAttributes.entity_picture !== nextAttributes.entity_picture
+    );
+  }
+
   private haEntityImage(path?: string): MassImage | undefined {
     if (!path) return undefined;
     if (/^https?:\/\//.test(path)) return { url: path, path: "", provider: "home_assistant" };
@@ -967,4 +1047,15 @@ async function importBridgeThingClient() {
 
 function compactRecord(record: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function dateSecondsOrUndefined(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time / 1000 : undefined;
 }

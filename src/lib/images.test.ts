@@ -33,9 +33,39 @@ describe("Music Assistant artwork helpers", () => {
     expect(itemImage(item)?.path).toBe("nested.jpg");
   });
 
+  it("prefers queue track artwork over album fallback artwork", () => {
+    const item = {
+      queue_item_id: "queue-1",
+      name: "Track",
+      media_item: {
+        uri: "library://track/1",
+        item_id: "1",
+        provider: "library",
+        name: "Track",
+        media_type: "track",
+        image: { path: "track.jpg", provider: "library" },
+        album: {
+          uri: "library://album/1",
+          item_id: "album-1",
+          provider: "library",
+          name: "Album",
+          media_type: "album",
+          image: { path: "album.jpg", provider: "library" },
+        },
+      },
+    } satisfies QueueItem;
+
+    expect(itemImage(item)?.path).toBe("track.jpg");
+  });
+
   it("builds an encoded image proxy URL", () => {
     expect(imageUrl("http://ma.local:8095/", { path: "folder/cover art.jpg", provider: "filesystem" }, 256))
       .toBe("http://ma.local:8095/imageproxy?path=folder%252Fcover%2520art.jpg&provider=filesystem&size=256");
+  });
+
+  it("adds a cache key to proxied artwork", () => {
+    expect(imageUrl("http://ma.local:8095/", { path: "folder/cover art.jpg", provider: "filesystem" }, 256, "track 1"))
+      .toBe("http://ma.local:8095/imageproxy?path=folder%252Fcover%2520art.jpg&provider=filesystem&size=256&v=track%201");
   });
 
   it("uses opaque proxy IDs and supported thumbnail sizes", () => {
@@ -65,6 +95,13 @@ describe("Music Assistant artwork helpers", () => {
       provider: "spotify",
       url: "http://external-cdn.com/cover.jpg",
     } as any, 128)).toBe("http://external-cdn.com/cover.jpg");
+  });
+
+  it("adds a cache key to direct artwork URLs", () => {
+    expect(imageUrl("http://ma.local:8095", {
+      provider: "home_assistant",
+      url: "http://ha.local/api/media_player_proxy/media_player.office?token=abc",
+    } as any, 128, "new-track")).toBe("http://ha.local/api/media_player_proxy/media_player.office?token=abc&v=new-track");
   });
 
   it("normalizes direct Music Assistant imageproxy URLs", () => {

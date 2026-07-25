@@ -127,7 +127,7 @@ async function buildZip(files) {
   return Buffer.concat([...chunks, central, end]);
 }
 
-const files = (await listFiles(distDir)).sort();
+const files = (await listFiles(distDir)).filter((file) => !file.endsWith(".map")).sort();
 if (!files.some((file) => basename(file) === "manifest.json")) {
   throw new Error("dist/manifest.json is missing. Run npm run build:bridgething first.");
 }

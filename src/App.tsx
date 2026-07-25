@@ -71,6 +71,7 @@ const LIBRARY_PAGE_SIZE = 100;
 const VOLUME_COMMAND_DELAY_MS = 500;
 const VOLUME_OVERLAY_HIDE_MS = 3_000;
 const PLAYING_POSITION_FRESH_MS = 15_000;
+const EXTERNAL_PLAYBACK_REFRESH_MS = 4_000;
 const SIDE_BY_SIDE_PATH = "/music-assistant";
 const AUTO_RELOAD_STORAGE_KEY = "carthing-ma-last-auto-reload";
 
@@ -89,9 +90,9 @@ function urlLabel(transport: ConnectionConfig["transport"]): string {
 }
 
 function urlPlaceholder(transport: ConnectionConfig["transport"]): string {
-  if (transport === "homeassistant") return "https://your-home.ui.nabu.casa";
+  if (transport === "homeassistant") return "https://home-assistant.example.com";
   if (transport === "bridgething") return "https://music.example.com";
-  return "http://192.168.1.10:8095";
+  return "http://music-assistant.local:8095";
 }
 
 function returnToNocturne(): void {
@@ -113,6 +114,18 @@ function itemSubtitle(item: MediaItem): string {
 function formatTime(seconds = 0): string {
   const safe = Math.max(0, Math.floor(seconds));
   return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, "0")}`;
+}
+
+function artworkCacheKey(item?: QueueItem): string | undefined {
+  if (!item) return undefined;
+  const media = item.media_item;
+  return [
+    item.queue_item_id,
+    media?.uri,
+    media?.name,
+    media?.artists?.map((artist) => artist.name).join(","),
+    media?.album?.name,
+  ].filter(Boolean).join("|") || undefined;
 }
 
 function configDisplaySize(value: string | null | undefined): DisplaySize | undefined {
@@ -521,6 +534,14 @@ export default function App() {
   }, [connection, connect, config, sideBySide]);
 
   useEffect(() => {
+    if (connection !== "connected") return;
+    const interval = window.setInterval(() => {
+      void refreshCore();
+    }, EXTERNAL_PLAYBACK_REFRESH_MS);
+    return () => window.clearInterval(interval);
+  }, [connection, refreshCore]);
+
+  useEffect(() => {
     if (!sideBySide || !isLocalRelayUrl(config.serverUrl)) return;
     const watchdog = window.setInterval(() => {
       if (connectionStateRef.current === "connected") return;
@@ -851,7 +872,7 @@ export default function App() {
 
   return (
     <main className="device-shell" data-display-size={displaySize} data-now-playing-text-size={nowPlayingTextSize}>
-      <div className="ambient" style={{ backgroundImage: currentItem ? `url(${imageUrl(config.serverUrl, itemImage(currentItem), 256)})` : undefined }} />
+      <div className="ambient" style={{ backgroundImage: currentItem ? `url(${imageUrl(config.serverUrl, itemImage(currentItem), 256, artworkCacheKey(currentItem))})` : undefined }} />
 
       <section className="content">
         {view === "now" && (
@@ -988,7 +1009,7 @@ function NowPlaying({ item, serverUrl, playing, queue, shuffleEnabled, repeatMod
 
   // The Car Thing runs Chromium 69. Keep this at the same image-proxy size as
   // the library thumbnails, which is known to decode reliably on the device.
-  const image = imageUrl(serverUrl, itemImage(item), 256);
+  const image = imageUrl(serverUrl, itemImage(item), 256, artworkCacheKey(item));
   const media = item?.media_item;
   const title = media?.name || item?.name || "Nothing playing";
   const artist = media ? itemSubtitle(media) : "Select something from your library";
