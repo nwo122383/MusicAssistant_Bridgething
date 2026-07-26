@@ -1,6 +1,6 @@
 {
   "schema": "catalog.v1",
-  "updated_at": "2026-07-25T22:45:00Z",
+  "updated_at": "2026-07-26T00:00:00Z",
   "repo": {
     "name": "Music Assistant BridgeThing",
     "description": "BridgeThing apps for Music Assistant.",
@@ -26,7 +26,7 @@
             "sha256": "25576e31d6cca7e8603af2de51d7714292f790284c7383143ee1af29da214ab1"
           },
           "permissions": ["net.ws", "net.proxy"],
-          "min_libbridgething_version": "0.3.0",
+          "min_libbridgething_version": "0.4.0",
           "changelog": "Initial release."
         }
       ]
