@@ -5,6 +5,7 @@ type MassTransport = "direct" | "bridgething" | "homeassistant";
 const HA_CONNECT_TIMEOUT_MS = 30_000;
 const HA_COMMAND_TIMEOUT_MS = 12_000;
 const HA_MASS_PLAYER_TEMPLATE = `{{ states.media_player | selectattr('attributes.mass_player_type', 'defined') | map(attribute='entity_id') | list | tojson }}`;
+const GENERIC_HA_RADIO_ARTISTS = new Set(["", "radio", "live radio", "stream", "unknown"]);
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -401,7 +402,7 @@ export class MassClient {
         this.hydrateHaQueue(queue)
           .then((hydrated) => {
             this.haHydratedQueues.set(hydrated.queue_id, hydrated);
-            return hydrated;
+            return this.mergeHaQueueState(queue.queue_id, queue);
           })
           .catch(() => this.mergeHaQueueState(queue.queue_id, queue)),
       ),
@@ -508,8 +509,9 @@ export class MassClient {
     const queue = await this.hydrateHaQueue(this.haStateToQueue(state));
     if (this.haQueueHydrationSequence.get(entityId) !== sequence) return;
     this.haHydratedQueues.set(entityId, queue);
+    const mergedQueue = this.mergeHaQueueState(entityId, this.haStateToQueue(state));
     this.eventListeners.forEach((listener) => {
-      listener({ event: "queue_updated", object_id: entityId, data: queue });
+      listener({ event: "queue_updated", object_id: entityId, data: mergedQueue });
     });
   }
 
@@ -831,6 +833,7 @@ export class MassClient {
   private mergeHaQueueState(queueId: string, base: PlayerQueue): PlayerQueue {
     const hydrated = this.haHydratedQueues.get(queueId);
     if (!hydrated?.current_item) return base;
+    const currentItem = this.shouldPreferHaCurrentItem(base, hydrated) ? base.current_item : hydrated.current_item;
     return {
       ...hydrated,
       display_name: base.display_name,
@@ -841,7 +844,31 @@ export class MassClient {
       state: base.state,
       elapsed_time: base.elapsed_time,
       elapsed_time_last_updated: base.elapsed_time_last_updated,
+      current_item: currentItem,
     };
+  }
+
+  private shouldPreferHaCurrentItem(base: PlayerQueue, hydrated: PlayerQueue): boolean {
+    if (!base.current_item) return false;
+    const baseMedia = base.current_item.media_item;
+    if (!baseMedia) return false;
+
+    const baseTitle = normalizeText(baseMedia.name || base.current_item.name);
+    const station = normalizeText(baseMedia.album?.name);
+    const artists = (baseMedia.artists ?? []).map((artist) => normalizeText(artist.name)).filter(Boolean);
+    const hasSpecificArtist = artists.some((artist) => !GENERIC_HA_RADIO_ARTISTS.has(artist));
+    const titleDiffersFromStation = !!baseTitle && !!station && baseTitle !== station;
+    if (!hasSpecificArtist && !titleDiffersFromStation) return false;
+
+    const hydratedMedia = hydrated.current_item?.media_item;
+    const hydratedTitle = normalizeText(hydratedMedia?.name || hydrated.current_item?.name);
+    const hydratedArtists = (hydratedMedia?.artists ?? []).map((artist) => normalizeText(artist.name)).filter(Boolean);
+    const hydratedLooksLikeStation =
+      hydratedMedia?.media_type === "radio" ||
+      hydratedArtists.some((artist) => GENERIC_HA_RADIO_ARTISTS.has(artist)) ||
+      (!!station && hydratedTitle === station);
+
+    return hydratedLooksLikeStation || titleDiffersFromStation;
   }
 
   private haStateToQueueItem(state: HaState): QueueItem | undefined {
@@ -1081,6 +1108,10 @@ async function importBridgeThingClient() {
 
 function compactRecord(record: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
+}
+
+function normalizeText(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
 }
 
 function numberOrUndefined(value: unknown): number | undefined {
