@@ -1,6 +1,6 @@
 {
   "schema": "catalog.v1",
-  "updated_at": "2026-08-01T13:35:56Z",
+  "updated_at": "2026-08-01T14:24:02Z",
   "repo": {
     "name": "Music Assistant BridgeThing",
     "description": "BridgeThing apps for Music Assistant.",
@@ -18,6 +18,21 @@
       "source": "https://github.com/nwo122383/MusicAssistant_Bridgething",
       "versions": [
         {
+          "version": "0.1.3",
+          "released_at": "2026-08-01T14:24:02Z",
+          "download": {
+            "url": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/music-assistant-bridgething-v0.1.3.zip",
+            "size": 169099,
+            "sha256": "ffa23a3d2de5eb5c0cdbafed34f26d12fd945d0ca6ff915fe07787447f4e08f4"
+          },
+          "permissions": [
+            "net.ws",
+            "net.proxy"
+          ],
+          "min_libbridgething_version": "0.4.0",
+          "changelog": "Prefer live Home Assistant radio metadata for Music Assistant streams so Now Playing stays on the actual song, artist, station, and artwork instead of cycling back to the station entry."
+        },
+        {
           "version": "0.1.2",
           "released_at": "2026-08-01T13:35:56Z",
           "download": {
@@ -25,7 +40,10 @@
             "size": 168865,
             "sha256": "18bc6602b833969876595a58d27dd64ef49e6792e9a7daf8ea0f6168679877d0"
           },
-          "permissions": ["net.ws", "net.proxy"],
+          "permissions": [
+            "net.ws",
+            "net.proxy"
+          ],
           "min_libbridgething_version": "0.4.0",
           "changelog": "Keep retrying Music Assistant reconnects after long BridgeThing phone disconnects and preserve hydrated Music Assistant current-track data so radio/SiriusXM station updates do not flicker between station metadata and the playing track."
         },
@@ -37,7 +55,10 @@
             "size": 168733,
             "sha256": "f7b927c5f57e1e014af36c16cc1270fac42d5b7fed82b1866807b5a349abe82c"
           },
-          "permissions": ["net.ws", "net.proxy"],
+          "permissions": [
+            "net.ws",
+            "net.proxy"
+          ],
           "min_libbridgething_version": "0.4.0",
           "changelog": "Improve recovery after BridgeThing phone reconnects by checking the live Music Assistant socket and reconnecting before commands, library loads, and refreshes."
         },
@@ -49,7 +70,10 @@
             "size": 168458,
             "sha256": "25576e31d6cca7e8603af2de51d7714292f790284c7383143ee1af29da214ab1"
           },
-          "permissions": ["net.ws", "net.proxy"],
+          "permissions": [
+            "net.ws",
+            "net.proxy"
+          ],
           "min_libbridgething_version": "0.4.0",
           "changelog": "Initial release."
         }
