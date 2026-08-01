@@ -178,6 +178,7 @@ export default function App() {
   const connectInFlight = useRef<Promise<void> | undefined>(undefined);
   const connectionStateRef = useRef<ConnectionState>("idle");
   const connectionStateChangedAt = useRef(Date.now());
+  const configRef = useRef(config);
 
   const activePlayer = players.find((player) => player.player_id === activePlayerId) ?? players[0];
   const activeQueue =
@@ -199,6 +200,10 @@ export default function App() {
     connectionStateRef.current = connection;
     connectionStateChangedAt.current = Date.now();
   }, [connection]);
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
 
   useEffect(() => {
     if (!isBridgeThingRuntime(sideBySide)) return;
@@ -303,6 +308,30 @@ export default function App() {
     },
     [client, config, refreshCore, sideBySide],
   );
+
+  const scheduleReconnect = useCallback(
+    (delay = 2_000) => {
+      window.clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = window.setTimeout(() => {
+        const nextConfig = configRef.current;
+        if (nextConfig.serverUrl) void connect(nextConfig);
+      }, delay);
+    },
+    [connect],
+  );
+
+  const ensureConnected = useCallback(async () => {
+    if (connectionStateRef.current === "connected" && client.isConnected()) return true;
+    const nextConfig = configRef.current;
+    if (!nextConfig.serverUrl) {
+      setView("settings");
+      showNotice("Music Assistant is not configured");
+      return false;
+    }
+    showNotice("Reconnecting to Music Assistant...");
+    await connect(nextConfig);
+    return client.isConnected();
+  }, [client, connect, showNotice]);
 
   useEffect(() => {
     if (!isBridgeThingRuntime(sideBySide)) return;
@@ -431,7 +460,7 @@ export default function App() {
     });
     const removeClose = client.onClose(() => {
       setConnection((current) => {
-        if (current === "connected") reconnectTimer.current = window.setTimeout(() => void connect(), 2_000);
+        if (current === "connected") scheduleReconnect();
         return current === "idle" ? current : "error";
       });
     });
@@ -536,10 +565,47 @@ export default function App() {
   useEffect(() => {
     if (connection !== "connected") return;
     const interval = window.setInterval(() => {
-      void refreshCore();
+      if (!client.isConnected()) {
+        setConnection("error");
+        scheduleReconnect();
+        return;
+      }
+      void refreshCore().catch((reason) => {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        setConnection("error");
+        scheduleReconnect();
+      });
     }, EXTERNAL_PLAYBACK_REFRESH_MS);
     return () => window.clearInterval(interval);
-  }, [connection, refreshCore]);
+  }, [client, connection, refreshCore, scheduleReconnect]);
+
+  useEffect(() => {
+    const reconnectIfNeeded = () => {
+      const nextConfig = configRef.current;
+      if (!nextConfig.serverUrl) return;
+      if (connectionStateRef.current === "connected" && client.isConnected()) {
+        void refreshCore().catch(() => {
+          setConnection("error");
+          scheduleReconnect(750);
+        });
+        return;
+      }
+      scheduleReconnect(750);
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") reconnectIfNeeded();
+    };
+    window.addEventListener("focus", reconnectIfNeeded);
+    window.addEventListener("online", reconnectIfNeeded);
+    window.addEventListener("pageshow", reconnectIfNeeded);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      window.removeEventListener("focus", reconnectIfNeeded);
+      window.removeEventListener("online", reconnectIfNeeded);
+      window.removeEventListener("pageshow", reconnectIfNeeded);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [client, refreshCore, scheduleReconnect]);
 
   useEffect(() => {
     if (!sideBySide || !isLocalRelayUrl(config.serverUrl)) return;
@@ -553,7 +619,10 @@ export default function App() {
 
   const loadLibrary = useCallback(
     async (kind: LibraryKind, query = "", append = false) => {
-      if (connection !== "connected") return;
+      if (connection !== "connected" || !client.isConnected()) {
+        const connected = await ensureConnected();
+        if (!connected) return;
+      }
       const requestId = ++libraryRequestId.current;
       const trimmedQuery = query.trim();
       setLibraryBusy(true);
@@ -591,7 +660,7 @@ export default function App() {
         if (libraryRequestId.current === requestId) setLibraryBusy(false);
       }
     },
-    [client, connection, library.length, showNotice],
+    [client, connection, ensureConnected, library.length, showNotice],
   );
 
   useEffect(() => {
@@ -643,10 +712,7 @@ export default function App() {
     async (command: string, args?: Record<string, unknown>) => {
       if (!activePlayer) return;
       try {
-        if (connection !== "connected") {
-          showNotice("Reconnecting to Music Assistant…");
-          await connect(config);
-        }
+        if (!(await ensureConnected())) return;
         await client.command(`players/cmd/${command}`, { player_id: activePlayer.player_id, ...args });
         if (command !== "volume_set") {
           window.setTimeout(() => void refreshCore(), 350);
@@ -656,24 +722,21 @@ export default function App() {
         showNotice(reason instanceof Error ? reason.message : "Command failed");
       }
     },
-    [activePlayer, client, config, connect, connection, refreshCore, showNotice],
+    [activePlayer, client, ensureConnected, refreshCore, showNotice],
   );
 
   const queueCommand = useCallback(
     async (command: string, args?: Record<string, unknown>) => {
       if (!activeQueue) return;
       try {
-        if (connection !== "connected") {
-          showNotice("Reconnecting to Music Assistant…");
-          await connect(config);
-        }
+        if (!(await ensureConnected())) return;
         await client.command(`player_queues/${command}`, { queue_id: activeQueue.queue_id, ...args });
         window.setTimeout(() => void refreshCore(), 350);
       } catch (reason) {
         showNotice(reason instanceof Error ? reason.message : "Queue command failed");
       }
     },
-    [activeQueue, client, config, connect, connection, refreshCore, showNotice],
+    [activeQueue, client, ensureConnected, refreshCore, showNotice],
   );
 
   const setQueueMode = useCallback(
@@ -760,6 +823,7 @@ export default function App() {
     async (media: MediaItem | Preset) => {
       if (!activePlayer) return showNotice("Select a player first");
       try {
+        if (!(await ensureConnected())) return;
         await client.command("player_queues/play_media", {
           queue_id: activeQueue?.queue_id || activePlayer.player_id,
           media: media.uri,
@@ -773,7 +837,7 @@ export default function App() {
         showNotice(reason instanceof Error ? reason.message : "Unable to play item");
       }
     },
-    [activePlayer, activeQueue?.queue_id, client, refreshCore, showNotice],
+    [activePlayer, activeQueue?.queue_id, client, ensureConnected, refreshCore, showNotice],
   );
 
   const changeVolume = useCallback(

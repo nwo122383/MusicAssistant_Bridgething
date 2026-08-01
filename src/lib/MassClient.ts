@@ -159,6 +159,10 @@ export class MassClient {
     return () => this.closeListeners.delete(listener);
   }
 
+  isConnected(): boolean {
+    return this.socket?.isOpen() === true;
+  }
+
   disconnect(): void {
     this.socket?.close();
     this.socket = undefined;
@@ -1015,7 +1019,7 @@ function createBridgeThingSocket(
 
   const socket: TransportSocket = {
     ready,
-    isOpen: () => !closed,
+    isOpen: () => open && !closed,
     send: (data) => {
       if (closed) return;
       if (!open) {

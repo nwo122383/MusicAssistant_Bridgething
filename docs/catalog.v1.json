@@ -1,6 +1,6 @@
 {
   "schema": "catalog.v1",
-  "updated_at": "2026-07-26T00:00:00Z",
+  "updated_at": "2026-08-01T12:58:27Z",
   "repo": {
     "name": "Music Assistant BridgeThing",
     "description": "BridgeThing apps for Music Assistant.",
@@ -17,6 +17,18 @@
       "homepage": "https://github.com/nwo122383/MusicAssistant_Bridgething",
       "source": "https://github.com/nwo122383/MusicAssistant_Bridgething",
       "versions": [
+        {
+          "version": "0.1.1",
+          "released_at": "2026-08-01T12:58:27Z",
+          "download": {
+            "url": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/music-assistant-bridgething-v0.1.1.zip",
+            "size": 168733,
+            "sha256": "f7b927c5f57e1e014af36c16cc1270fac42d5b7fed82b1866807b5a349abe82c"
+          },
+          "permissions": ["net.ws", "net.proxy"],
+          "min_libbridgething_version": "0.4.0",
+          "changelog": "Improve recovery after BridgeThing phone reconnects by checking the live Music Assistant socket and reconnecting before commands, library loads, and refreshes."
+        },
         {
           "version": "0.1.0",
           "released_at": "2026-07-25T22:30:00Z",
