@@ -3,7 +3,7 @@ import type { MassEvent, MassImage, MediaItem, Player, PlayerQueue, QueueItem } 
 type MassTransport = "direct" | "bridgething" | "homeassistant";
 
 const HA_CONNECT_TIMEOUT_MS = 30_000;
-const HA_COMMAND_TIMEOUT_MS = 25_000;
+const HA_COMMAND_TIMEOUT_MS = 12_000;
 const HA_MASS_PLAYER_TEMPLATE = `{{ states.media_player | selectattr('attributes.mass_player_type', 'defined') | map(attribute='entity_id') | list | tojson }}`;
 
 type Pending = {
@@ -34,6 +34,7 @@ export class MassClient {
   private haStates = new Map<string, HaState>();
   private haMassConfigEntryId = "";
   private haRefreshInFlight?: Promise<void>;
+  private haHydratedQueues = new Map<string, PlayerQueue>();
   private haQueueHydrationSequence = new Map<string, number>();
 
   async connect(serverUrl: string, token?: string, transport: MassTransport = "direct"): Promise<void> {
@@ -168,6 +169,7 @@ export class MassClient {
     this.socket = undefined;
     this.haStates.clear();
     this.haMassConfigEntryId = "";
+    this.haHydratedQueues.clear();
     this.haQueueHydrationSequence.clear();
     this.rejectPending(new Error("Connection replaced"));
   }
@@ -394,7 +396,16 @@ export class MassClient {
 
   private async haQueues(): Promise<PlayerQueue[]> {
     const queues = this.haMediaStates().map((state) => this.haStateToQueue(state));
-    return Promise.all(queues.map((queue) => this.hydrateHaQueue(queue).catch(() => queue)));
+    return Promise.all(
+      queues.map((queue) =>
+        this.hydrateHaQueue(queue)
+          .then((hydrated) => {
+            this.haHydratedQueues.set(hydrated.queue_id, hydrated);
+            return hydrated;
+          })
+          .catch(() => this.mergeHaQueueState(queue.queue_id, queue)),
+      ),
+    );
   }
 
   private haMediaStates(): HaState[] {
@@ -482,9 +493,10 @@ export class MassClient {
   }
 
   private emitHaState(state: HaState): void {
+    const queue = this.mergeHaQueueState(state.entity_id, this.haStateToQueue(state));
     this.eventListeners.forEach((listener) => {
       listener({ event: "player_updated", object_id: state.entity_id, data: this.haStateToPlayer(state) });
-      listener({ event: "queue_updated", object_id: state.entity_id, data: this.haStateToQueue(state) });
+      listener({ event: "queue_updated", object_id: state.entity_id, data: queue });
     });
   }
 
@@ -495,6 +507,7 @@ export class MassClient {
     this.haQueueHydrationSequence.set(entityId, sequence);
     const queue = await this.hydrateHaQueue(this.haStateToQueue(state));
     if (this.haQueueHydrationSequence.get(entityId) !== sequence) return;
+    this.haHydratedQueues.set(entityId, queue);
     this.eventListeners.forEach((listener) => {
       listener({ event: "queue_updated", object_id: entityId, data: queue });
     });
@@ -657,9 +670,10 @@ export class MassClient {
     const result = await this.haRequest<{ response?: unknown }>("call_service", payload);
     const state = entityId ? this.haStates.get(entityId) : undefined;
     if (state) {
+      const queue = this.mergeHaQueueState(state.entity_id, this.haStateToQueue(state));
       this.eventListeners.forEach((listener) => {
         listener({ event: "player_updated", object_id: entityId, data: this.haStateToPlayer(state) });
-        listener({ event: "queue_updated", object_id: entityId, data: this.haStateToQueue(state) });
+        listener({ event: "queue_updated", object_id: entityId, data: queue });
       });
     }
     return result?.response;
@@ -811,6 +825,22 @@ export class MassClient {
       current_index: item ? 0 : undefined,
       index_in_buffer: item ? 0 : undefined,
       items: item ? 1 : 0,
+    };
+  }
+
+  private mergeHaQueueState(queueId: string, base: PlayerQueue): PlayerQueue {
+    const hydrated = this.haHydratedQueues.get(queueId);
+    if (!hydrated?.current_item) return base;
+    return {
+      ...hydrated,
+      display_name: base.display_name,
+      active: base.active,
+      available: base.available,
+      shuffle_enabled: base.shuffle_enabled,
+      repeat_mode: base.repeat_mode,
+      state: base.state,
+      elapsed_time: base.elapsed_time,
+      elapsed_time_last_updated: base.elapsed_time_last_updated,
     };
   }
 

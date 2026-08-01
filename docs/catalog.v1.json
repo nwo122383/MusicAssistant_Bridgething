@@ -1,6 +1,6 @@
 {
   "schema": "catalog.v1",
-  "updated_at": "2026-08-01T12:58:27Z",
+  "updated_at": "2026-08-01T13:35:56Z",
   "repo": {
     "name": "Music Assistant BridgeThing",
     "description": "BridgeThing apps for Music Assistant.",
@@ -17,6 +17,18 @@
       "homepage": "https://github.com/nwo122383/MusicAssistant_Bridgething",
       "source": "https://github.com/nwo122383/MusicAssistant_Bridgething",
       "versions": [
+        {
+          "version": "0.1.2",
+          "released_at": "2026-08-01T13:35:56Z",
+          "download": {
+            "url": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/music-assistant-bridgething-v0.1.2.zip",
+            "size": 168865,
+            "sha256": "18bc6602b833969876595a58d27dd64ef49e6792e9a7daf8ea0f6168679877d0"
+          },
+          "permissions": ["net.ws", "net.proxy"],
+          "min_libbridgething_version": "0.4.0",
+          "changelog": "Keep retrying Music Assistant reconnects after long BridgeThing phone disconnects and preserve hydrated Music Assistant current-track data so radio/SiriusXM station updates do not flicker between station metadata and the playing track."
+        },
         {
           "version": "0.1.1",
           "released_at": "2026-08-01T12:58:27Z",

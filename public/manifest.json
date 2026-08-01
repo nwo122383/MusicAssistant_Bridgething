@@ -1,7 +1,7 @@
 {
   "id": "019f9b5e-7cea-7866-8086-d8ba20311b32",
   "name": "Music Assistant",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Music Assistant controller for BridgeThing",
   "icon": null,
   "settings": "settings.html",

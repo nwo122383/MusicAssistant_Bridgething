@@ -536,14 +536,16 @@ export default function App() {
   useEffect(() => {
     if (connection === "error") {
       const localRelay = isLocalRelayUrl(config.serverUrl);
+      const retryDelay = localRelay ? 4_000 : 8_000;
       reconnectTimer.current = window.setTimeout(() => {
-        void connect();
+        const nextConfig = configRef.current;
+        if (nextConfig.serverUrl) void connect(nextConfig);
       }, localRelay ? 2_000 : 5_000);
-      const interval = localRelay
-        ? window.setInterval(() => {
-            void connect(config);
-          }, 4_000)
-        : undefined;
+      const interval = window.setInterval(() => {
+        if (connectionStateRef.current !== "error") return;
+        const nextConfig = configRef.current;
+        if (nextConfig.serverUrl) void connect(nextConfig);
+      }, retryDelay);
       const reload = localRelay && sideBySide
         ? window.setTimeout(() => {
             const lastReload = Number(window.sessionStorage.getItem(AUTO_RELOAD_STORAGE_KEY) || "0");
@@ -555,7 +557,7 @@ export default function App() {
         : undefined;
       return () => {
         clearTimeout(reconnectTimer.current);
-        if (interval) window.clearInterval(interval);
+        window.clearInterval(interval);
         if (reload) window.clearTimeout(reload);
       };
     }
