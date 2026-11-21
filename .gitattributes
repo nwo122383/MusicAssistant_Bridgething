@@ -1,0 +1,2 @@
+# Hosted settings are checksummed against the exact bytes inside the app ZIP.
+docs/*-settings.html -text

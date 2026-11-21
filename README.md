@@ -8,143 +8,223 @@
 
 
 
-A BridgeThing webapp for controlling Music Assistant from a Spotify Car Thing.
+A Music Assistant controller for Spotify Car Thing running BridgeThing.
 
-The app runs on BridgeThing firmware and is configured from the BridgeThing
-companion app. It can connect through Home Assistant / Nabu Casa or, for setups
-that expose Music Assistant directly, through Music Assistant's own websocket
-API.
+**Latest release: 0.1.5.** [What's changed and upgrade notes](docs/releases/v0.1.5.md).
 
-## Features
+## Requirements
 
-- Now Playing screen with album art, progress, shuffle, repeat, and transport controls.
-- Music Assistant library browsing for recent items, playlists, albums, artists, and radio.
-- Player selection for available Music Assistant outputs.
-- Queue view with physical dial navigation.
-- Four physical preset buttons for favorite playlists or library items.
-- Volume control using the Car Thing dial with an on-screen volume overlay.
-- Brightness, display size, and Now Playing text size settings.
+- BridgeThing device firmware/libbridgething **0.17.1 or newer**.
+- A current BridgeThing companion app. Android **0.17.0** was used for testing.
+- A Music Assistant server. Tested with **MA 2.10.13**.
+- An existing MA playback device, or a separately configured phone audio player.
 
-## Install From BridgeThing
+No PC relay or custom BridgeThing firmware is needed for the webapp. The optional
+phone-audio helper is separate and experimental; see Phone Audio below.
 
-This repo publishes a BridgeThing `catalog.v1` source:
+## Install Or Update
+
+Music Assistant is listed in the BridgeThing app directory. If you already use
+this source, refresh it and install the latest compatible version. There is no
+need to add a new source for each update.
+
+To add the source manually, paste this URL in BridgeThing's source/store screen:
 
 ```text
 https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/catalog.v1.json
 ```
 
-Add that source in the BridgeThing app store/source screen, then install
-`Music Assistant`.
+For manual webapp installation, use
+[the 0.1.5 ZIP](docs/music-assistant-bridgething-v0.1.5.zip). This is an app bundle,
+**not** a Car Thing firmware image. The app ID stays the same across releases so
+BridgeThing can update an existing installation in place.
 
-The installable app zip is also stored in this repo at:
+## Connect And Sign In
 
-```text
-docs/music-assistant-bridgething-v0.1.0.zip
-```
+On your phone, open BridgeThing, select Music Assistant, and open its settings.
+Choose the connection path that matches your setup. The credentials are not
+interchangeable:
 
-That zip is referenced by the catalog. You normally submit or add the catalog
-URL, not the zip URL directly.
+| Connection Path | Address | Authentication |
+| --- | --- | --- |
+| Music Assistant WebRTC | MA Remote ID | MA username/password after connecting, or an existing MA token |
+| Home Assistant / Nabu Casa | Remote HA HTTPS URL | HA long-lived access token |
+| BridgeThing companion network | Reachable MA HTTPS URL | MA access token, or MA login on the Car Thing |
+| Direct browser connection | MA HTTP/HTTPS URL reachable by the Car Thing browser | MA access token, or MA login on the Car Thing |
 
-## Configure
+### Music Assistant WebRTC
 
-Open the BridgeThing companion app on your phone, select the installed
-`Music Assistant` app, then open its settings.
+This is the Remote ID connection path for reaching MA without a public MA server
+URL or a PC relay.
 
-For Home Assistant / Nabu Casa:
+1. In Music Assistant, open Settings > Remote Access and enable remote access.
+2. Copy its Remote ID.
+3. If you use Nabu Casa, enable **WebRTC Connections** in Home Assistant Cloud
+   settings. This BridgeThing route requires TCP/TLS TURN, because the phone-backed
+   network proxy carries TCP rather than UDP.
+4. In our BridgeThing phone settings, choose **Music Assistant WebRTC**, enter the
+   Remote ID, and press **Connect WebRTC**.
+5. Once connected, enter your **Music Assistant** username and password, then
+   press **Sign in and save**.
 
-- Set `Connection path` to `Home Assistant / Nabu Casa`.
-- Set `Server URL` to your Home Assistant URL.
-- Set `Access token` to a Home Assistant long-lived access token.
+You do not need to generate a token manually. The optional access-token field is
+an alternative for people who already have one. The sign-in form uses an MA
+account, not Home Assistant OAuth credentials.
 
-For direct Music Assistant:
+The password is not persisted by our app. The returned token is saved in
+BridgeThing's app configuration and the Car Thing's browser storage for
+reconnects. Treat device storage and backups as sensitive.
 
-- Set `Connection path` to `Direct browser connection` or `BridgeThing companion network`.
-- Set `Server URL` to the Music Assistant server URL.
-- If Music Assistant auth is enabled, use the in-app setup screen on the
-  Car Thing for username/password login.
+The connection uses Music Assistant's remote transport with DTLS fingerprint
+verification. API traffic and remote artwork use the encrypted WebRTC connection.
+WebRTC control does not, by itself, register the phone as a speaker.
 
-The Car Thing screen also has an app settings page for display preferences,
-presets, and direct connection controls. The primary phone-side settings live in
-the BridgeThing companion app.
+### Home Assistant / Nabu Casa
 
-## Build
+Choose **Home Assistant / Nabu Casa**, enter your remote HA HTTPS URL and a
+**Home Assistant long-lived access token**, then save. An MA token will not work
+for this path.
 
-Install dependencies:
+AI Radio and group management use MA add-on ingress through the existing HA
+connection. They need HA Supervisor/admin access and an enabled MA ingress panel.
+No second URL or MA token is needed for those features in HA mode.
 
-```bash
-npm install
-```
+### Other MA URL Connections
 
-Build the BridgeThing webapp and companion settings page:
+Use **BridgeThing companion network** when MA has a reachable HTTPS address.
+Use **Direct browser connection** only when the Car Thing browser itself can
+reach the URL. A home LAN address is not a remote-car connection.
 
-```bash
-npm run build:bridgething
-```
+For these paths, use MA authentication, not an HA token. MA username/password
+login remains available on the Car Thing setup screen.
 
-Create the release zip:
+## Features And Controls
 
-```bash
-npm run release:bridgething
-```
+- Now Playing with artwork, elapsed time, shuffle, repeat, and transport controls.
+- Library tabs for Recent, Playlists, Albums, Artists, Radio, and AI Radio.
+- Cached tab results, Recent/Playlists preloading, small first pages, Load More,
+  and a refresh button. First loads and uncached artwork still depend on the link.
+- Players/Groups views, current group membership, compatible member editing, and
+  a confirmed Ungroup All recovery action. Fixed group members remain locked.
+- Queue browsing, track selection, play-next, and removal.
+- Four physical preset buttons: select a library item and hold a top button to
+  save it; press the button later to play it on the selected player.
+- Dial volume with an on-screen bar. The dial scrolls Players and selects queue
+  items in those views; pressing it plays the selected queue item in Queue.
+- BridgeThing voice playback requests using the selected player. Availability
+  and speech recognition depend on BridgeThing.
+- Phone settings for display size, Now Playing text size, and brightness.
 
-The zip is written to:
+**Ungroup All can affect multiple rooms and may stop playback.** It releases
+active grouping without deleting saved group definitions. Offline speakers may
+need to reconnect before MA can release them.
 
-```text
-release/music-assistant-bridgething-v0.1.0.zip
-```
+## AI Radio
 
-The release package contains the BridgeThing webapp files rooted at the app
-level: `manifest.json`, `index.html`, `settings.html`, and `assets/`.
+Configure MA's AI Radio plugin, its AI/speech engines, and saved shows in MA
+first. Then open Library > AI Radio on the Car Thing and play a show on the
+selected player. Switching an already-running show asks for confirmation.
 
-## Publish A New Version
+Show creation and host editing remain in Music Assistant. This tab is not a
+replacement for configuring the plugin on the server.
 
-After changing the app:
+## Phone Audio
 
-```bash
-npm run release:bridgething
-cp release/music-assistant-bridgething-v0.1.0.zip docs/music-assistant-bridgething-v0.1.0.zip
-sha256sum docs/music-assistant-bridgething-v0.1.0.zip
-stat -c '%s' docs/music-assistant-bridgething-v0.1.0.zip
-```
+The Car Thing is the controller; the phone receives music and routes it to the
+car stereo through the phone's normal media output.
 
-Update `docs/catalog.v1.json` with the new `updated_at`, `released_at`,
-`download.size`, and `download.sha256` values. Keep the app `id` unchanged so
-BridgeThing can upgrade existing installs in place.
+If the official MA Android app's local Sendspin player is enabled and connected,
+it can appear in Players, usually as **My Phone** unless you named it differently.
+Select that output in our Car Thing app. If it is hidden, check the player's
+visibility in Music Assistant.
+
+Use the **smartphone button** beside that player in Players to assign the volume
+wheel to the connected phone's actual media volume. This assignment is per
+player: Sonos and other speakers retain normal MA volume control. The on-screen
+volume bar follows Android's reported level.
+
+A selected phone assigned this way is preserved while it reconnects. The app
+waits for it rather than silently playing through a home speaker.
+
+### Optional Android Helper: Experimental
+
+The source in [phone-player](phone-player/README.md) uses MA's standard Android
+media service to activate its native Sendspin player without manually opening
+MA's screen in the intended daily flow. It does not replace BridgeThing, and it
+does not need a second Bluetooth data connection or its own MA credentials.
+
+It still requires the official MA Android app, initial MA sign-in/local-player
+setup, helper permissions, and Android device association.
+
+**Native phone registration and playback are verified; fully automatic
+locked-phone/cold-car startup is not yet verified.** The helper is not included
+in the webapp ZIP, and this release does not publish a helper APK. It is not
+required for controlling existing home speakers.
 
 ## Development
 
-Run the local Vite dev server:
-
 ```bash
-npm run dev
-```
-
-This is useful for browser UI work. The real BridgeThing connection path,
-hardware buttons, companion settings, and phone networking should be tested on a
-Car Thing running BridgeThing.
-
-Useful checks:
-
-```bash
-npx tsc -b --pretty false
+npm ci
 npm test -- --run
+npm run build:bridgething
 ```
 
-## Project Structure
+For browser UI development, `npm run dev` starts Vite. A development localhost
+page is not the end-user setup flow: normal users configure the installed app
+through BridgeThing on their phone. Hardware, phone networking, and reconnect
+behavior need testing on a real Car Thing.
 
-- `src/App.tsx`: main Car Thing UI.
-- `src/lib/MassClient.ts`: Music Assistant and Home Assistant transport client.
-- `src/lib/bridgething.ts`: BridgeThing config, doc, and hardware helpers.
-- `src/hooks/useHardware.ts`: Car Thing wheel and button event mapping.
-- `settings/main.tsx`: BridgeThing companion settings page.
-- `public/manifest.json`: BridgeThing app manifest.
-- `docs/catalog.v1.json`: public BridgeThing catalog source.
+## Prepare And Publish A Release
+
+1. Set the same new version in `package.json` and
+   `public/manifest.json`, and update the lockfile.
+2. Add that version's changelog, minimum BridgeThing version, and permissions to
+   `docs/catalog.v1.json`. Keep the existing app UUID unchanged.
+3. Write the release notes under `docs/releases/`.
+4. Run:
+
+```bash
+npm test -- --run
+npm run release:bridgething
+```
+
+The release command builds the app and phone settings page, packages the ZIP,
+copies the ZIP and matching hosted settings page into `docs/`, and updates
+the catalog's sizes, SHA-256 checksums, URLs, and release timestamp.
+
+For 0.1.5, the installable archive is written to:
+
+```text
+release/music-assistant-bridgething-v0.1.5.zip
+docs/music-assistant-bridgething-v0.1.5.zip
+```
+
+Commit and push the source, release notes, generated files in `docs/`, and
+updated catalog to `main`. Create the matching GitHub release and attach the
+ZIP from `release/`.
+
+BridgeThing periodically rechecks the same catalog URL, so a published new
+version does not require another source submission. Its directory/app may need
+time or a refresh to show the update. Pushing source code alone does not rebuild
+an already-published ZIP; run the release command for each version.
+
+The package contains only the built webapp, settings page, assets, and license
+notice. Source maps, local connection settings, diagnostics, and the experimental
+Android helper are not bundled.
+
+## Project Layout
+
+- `src/`: Car Thing UI, MA/HA/WebRTC clients, and tests.
+- `settings/`: self-contained BridgeThing phone settings page.
+- `public/manifest.json`: stable app identity and config declarations.
+- `docs/catalog.v1.json`: public catalog and versioned download metadata.
+- `docs/releases/`: release notes.
+- `phone-player/`: optional experimental Android media-service helper.
+- `scripts/`: build/package and older development utilities.
 
 ## Legacy Prototypes
 
-This project started as a Nocturne/relay experiment. Some older relay and
-side-by-side scripts remain in the repo for reference, but the current
-recommended install path is BridgeThing plus the BridgeThing companion app.
-
-The old Android relay prototype is in `android-relay/`, and the old Car Thing
-relay notes are in `docs/android-relay-protocol.md`.
+This started as a Nocturne/relay experiment. The old `android-relay/` project,
+PC relay, and side-by-side scripts remain for reference. They are not required
+for the current BridgeThing webapp. The new optional `phone-player/` helper is
+a different project and does not use that old relay transport.

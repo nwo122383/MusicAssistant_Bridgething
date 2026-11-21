@@ -1,11 +1,13 @@
 import type { ConnectionConfig } from "../types";
 import type { BrightnessPreference, DisplaySize, NowPlayingTextSize } from "./storage";
+import type { VoiceActivity, VoiceIntent } from "@bridgething/client";
 
 export type BridgeThingPreferences = {
   config?: ConnectionConfig;
   displaySize?: DisplaySize;
   nowPlayingTextSize?: NowPlayingTextSize;
   brightness?: BrightnessPreference;
+  phoneVolumePlayerId?: string;
 };
 
 export type BridgeThingConfigChange = {
@@ -17,6 +19,13 @@ export type BridgeThingDocChange = {
   key: string;
   value: string | null;
 };
+
+export type BridgeThingVoiceHandlers = {
+  activity?: (activity: VoiceActivity) => void;
+  intent?: (intent: VoiceIntent) => void;
+};
+
+export type BridgeThingBluetoothHandler = (connected: boolean) => void;
 
 export function isBridgeThingRuntime(sideBySide: boolean): boolean {
   const params = new URLSearchParams(window.location.search);
@@ -54,6 +63,61 @@ export async function subscribeBridgeThingDocs(
   };
 }
 
+export async function subscribeBridgeThingVoice(handlers: BridgeThingVoiceHandlers): Promise<() => void> {
+  const { BridgethingClient } = await import("@bridgething/client");
+  const client = new BridgethingClient();
+  const unsubscribers = [
+    handlers.activity ? client.voice.onActivity(handlers.activity) : undefined,
+    handlers.intent ? client.voice.onIntent(handlers.intent) : undefined,
+  ].filter((unsubscribe): unsubscribe is () => void => Boolean(unsubscribe));
+  return () => {
+    unsubscribers.forEach((unsubscribe) => unsubscribe());
+    client.close();
+  };
+}
+
+export async function subscribeBridgeThingBluetooth(handler: BridgeThingBluetoothHandler): Promise<() => void> {
+  const { BridgethingClient } = await import("@bridgething/client");
+  const client = new BridgethingClient();
+  const unsubscribers = [
+    client.bluetooth.onStatus((status) => handler(status.connected)),
+    client.bluetooth.onConnectedDevice(() => handler(true)),
+  ];
+  return () => {
+    unsubscribers.forEach((unsubscribe) => unsubscribe());
+    client.close();
+  };
+}
+
+export type PhoneVolumeControl = { adjust: (direction: number) => Promise<void>; close: () => void };
+
+export async function connectBridgeThingPhoneVolume(onVolume: (percent: number) => void, onError: () => void): Promise<PhoneVolumeControl> {
+  const { BridgethingClient } = await import("@bridgething/client");
+  const client = new BridgethingClient();
+  let lastCommand = 0;
+  const offVolume = client.audio.onVolumeChanged(event => {
+    if (Number.isFinite(event.level)) onVolume(Math.round(Math.max(0, Math.min(1, event.level)) * 100));
+  });
+  const offError = client.audio.onErrorEvent(() => { if (Date.now() - lastCommand < 3000) onError(); });
+  return {
+    adjust: async direction => {
+      lastCommand = Date.now();
+      if (direction > 0) await client.audio.volumeUp();
+      else if (direction < 0) await client.audio.volumeDown();
+    },
+    close: () => { offVolume(); offError(); client.close(); },
+  };
+}
+
+export async function setBridgeThingPhoneVolumePlayer(playerId: string): Promise<void> {
+  const { BridgethingClient } = await import("@bridgething/client");
+  const client = new BridgethingClient();
+  try {
+    const result = await client.doc.set({ key: "phoneVolumePlayerId", value: playerId }, { timeoutMs: 3000 });
+    if (!result.ok) throw new Error("Unable to save phone volume player");
+  } finally { client.close(); }
+}
+
 export async function loadBridgeThingPreferences(): Promise<BridgeThingPreferences | undefined> {
   const { BridgethingClient } = await import("@bridgething/client");
   const client = new BridgethingClient();
@@ -82,16 +146,18 @@ export async function loadBridgeThingPreferences(): Promise<BridgeThingPreferenc
         : undefined;
     const brightnessLevel = normalizeLevel(Number(docEntries.brightnessLevel ?? configEntries.brightnessLevel ?? "0.55"));
     const preferences: BridgeThingPreferences = {
+      phoneVolumePlayerId: docEntries.phoneVolumePlayerId,
       displaySize: parseDisplaySize(docEntries.displaySize ?? configEntries.displaySize),
       nowPlayingTextSize: parseNowPlayingTextSize(docEntries.nowPlayingTextSize ?? configEntries.nowPlayingTextSize),
       brightness: brightnessMode ? { mode: brightnessMode, level: brightnessLevel } : undefined,
     };
-    if (!serverUrl) return preferences;
+    if (!serverUrl && !(configEntries.transport === "webrtc" && configEntries.remoteId?.trim())) return preferences;
     preferences.config = {
-      serverUrl,
+      serverUrl: serverUrl || "",
+      remoteId: configEntries.remoteId?.trim() || undefined,
       token: configEntries.token?.trim() || undefined,
       transport:
-        configEntries.transport === "homeassistant" || configEntries.transport === "direct"
+        configEntries.transport === "homeassistant" || configEntries.transport === "direct" || configEntries.transport === "webrtc"
           ? configEntries.transport
           : "bridgething",
     };

@@ -1,0 +1,949 @@
+/**
+ * WebRTC Transport
+ *
+ * Implements the transport interface using WebRTC DataChannel.
+ * Used for remote connections to Music Assistant instances via NAT traversal.
+ *
+ * Security: Uses DTLS certificate pinning for server authentication.
+ */
+
+import {
+  BaseTransport,
+  MessageTooLargeError,
+  TransportState,
+} from "./transport";
+import { SignalingClient, type IceServerConfig } from "./signaling";
+import { tcpRelayServers } from "../connection";
+import {
+  verifyAndSanitizeSdp,
+  CertificateVerificationError,
+} from "./crypto-utils";
+
+// Re-export for convenience
+export type { IceServerConfig };
+export { CertificateVerificationError };
+
+export interface WebRTCTransportOptions {
+  tcpRelayOnly?: boolean;
+  signalingServerUrl: string;
+  /**
+   * Remote server ID - encoded fingerprint of the server's DTLS certificate.
+   * Used for both routing and authentication.
+   */
+  remoteId: string;
+  dataChannelLabel?: string;
+  reconnect?: boolean;
+  reconnectDelay?: number;
+  maxReconnectDelay?: number;
+  reconnectDelayGrowth?: number;
+  maxReconnectAttempts?: number;
+  /**
+   * Skip certificate verification (for development only - INSECURE)
+   * Default: false
+   */
+  skipCertificateVerification?: boolean;
+}
+
+// Fallback ICE servers (only public STUN servers - no TURN)
+// These will only be used if the server doesn't provide ICE servers
+const FALLBACK_ICE_SERVERS: IceServerConfig[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun.cloudflare.com:3478" },
+];
+
+// A connection must hold this long before its success resets the backoff,
+// otherwise a flapping loop (which briefly connects) keeps backoff flat.
+const STABLE_CONNECTION_THRESHOLD_MS = 5000;
+
+// Proxied HTTP requests (album art, previews) get their own channel so their large
+// payloads don't hold up API messages.
+const HTTP_PROXY_CHANNEL_LABEL = "http_proxy";
+
+// Must match the server gateway (remote_access/gateway.py), which shares this frame format.
+const DATA_CHANNEL_CHUNK_SIZE = 64 * 1024;
+const DATA_CHANNEL_CHUNK_OVERHEAD = 128;
+const CHUNK_FRAME_TYPE = "__chunk__";
+// The gateway closes the session on a message of this size or more, so refuse it here.
+const DATA_CHANNEL_INBOUND_MAX_BYTES = 4 * 1024 * 1024;
+// Base64 encodes every 3 bytes as 4 characters.
+const BASE64_BYTES_PER_GROUP = 3;
+const BASE64_CHARS_PER_GROUP = 4;
+// JavaScriptCore caps a call at about 64K arguments, so bytes are spread in slices.
+const FROM_CHAR_CODE_SLICE = 8192;
+
+export class WebRTCTransport extends BaseTransport {
+  private options: Required<WebRTCTransportOptions>;
+  private signaling: SignalingClient;
+  private peerConnection: RTCPeerConnection | null = null;
+  private dataChannel: RTCDataChannel | null = null;
+  private httpProxyChannel: RTCDataChannel | null = null;
+  // The proxy channel is negotiated at most once per connection.
+  private httpProxyChannelRequested = false;
+  private iceCandidateBuffer: RTCIceCandidateInit[] = [];
+  private remoteDescriptionSet = false;
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private stableConnectionTimer: ReturnType<typeof setTimeout> | null = null;
+  private intentionalClose = false;
+  private connectionEpoch = 0;
+  private cancelConnectionWait?: (error: Error) => void;
+  // Serialises connect(); concurrent negotiation corrupts the shared pc/SDP state.
+  private connectInFlight = false;
+  private httpProxyCallbacks = new Map<
+    string,
+    {
+      resolve: (value: {
+        status: number;
+        headers: Record<string, string>;
+        body: Uint8Array;
+      }) => void;
+      reject: (error: Error) => void;
+      // requests sent on the proxy channel die with it, unlike those on the API channel
+      onProxyChannel: boolean;
+    }
+  >();
+  // Reassembly buffers for oversized messages the server splits into chunks, keyed by group id.
+  private chunkGroups = new Map<
+    number,
+    { count: number; parts: string[]; received: number }
+  >();
+  private chunkGroupSeq = 0;
+  // Response being reassembled on the proxy channel: its header, then raw body frames.
+  private pendingProxyBody: {
+    id: string;
+    status: number;
+    headers: Record<string, string>;
+    size: number;
+    parts: Uint8Array[];
+    received: number;
+  } | null = null;
+  // ICE servers received from the signaling server (provided by MA server)
+  private iceServers: IceServerConfig[] = [];
+
+  constructor(options: WebRTCTransportOptions) {
+    super();
+    this.options = {
+      tcpRelayOnly: options.tcpRelayOnly ?? false,
+      signalingServerUrl: options.signalingServerUrl,
+      remoteId: options.remoteId,
+      dataChannelLabel: options.dataChannelLabel || "ma-api",
+      reconnect: options.reconnect ?? true,
+      reconnectDelay: options.reconnectDelay ?? 1000,
+      maxReconnectDelay: options.maxReconnectDelay ?? 30000,
+      reconnectDelayGrowth: options.reconnectDelayGrowth ?? 1.5,
+      maxReconnectAttempts: options.maxReconnectAttempts ?? Infinity,
+      skipCertificateVerification: options.skipCertificateVerification ?? false,
+    };
+
+    this.signaling = new SignalingClient({
+      serverUrl: options.signalingServerUrl,
+      reconnect: false,
+    });
+
+    this.setupSignalingHandlers();
+  }
+
+  async connect(): Promise<void> {
+    // Let the in-flight attempt finish; a concurrent negotiation corrupts pc/SDP state.
+    if (this.connectInFlight) {
+      return;
+    }
+    this.connectInFlight = true;
+    const epoch = ++this.connectionEpoch;
+    const checkActive = () => {
+      if (epoch !== this.connectionEpoch || this.intentionalClose) throw new Error("Connection cancelled");
+    };
+    this.intentionalClose = false;
+    this.setState(TransportState.CONNECTING);
+
+    try {
+      // Connect to signaling server
+      await this.signaling.connect();
+      checkActive();
+
+      // Request connection - receives ICE servers from MA server
+      const { iceServers } = await this.signaling.requestConnection(
+        this.options.remoteId,
+      );
+      checkActive();
+
+      this.iceServers = iceServers || FALLBACK_ICE_SERVERS;
+      this.createPeerConnection();
+
+      // Create data channel (we're the initiator)
+      this.createDataChannel();
+
+      // Create and send offer (triggers ICE gathering)
+      const offer = await this.peerConnection!.createOffer();
+      checkActive();
+      await this.peerConnection!.setLocalDescription(offer);
+      checkActive();
+      this.signaling.sendOffer(offer);
+
+      // Wait for connection to be established
+      await this.waitForConnection();
+      checkActive();
+
+      // Reset backoff only once the connection proves stable, not on every connect.
+      this.scheduleBackoffReset();
+      this.setState(TransportState.CONNECTED);
+    } catch (error) {
+      console.error("[WebRTCTransport] Connection failed:", error);
+      this.cleanup();
+
+      // Only set to FAILED if we're not going to retry
+      // During reconnect attempts, keep the RECONNECTING state
+      if (this.reconnectAttempts === 0) {
+        // This is the initial connection attempt
+        this.setState(TransportState.FAILED);
+      } else if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+        // Max retries reached
+        this.setState(TransportState.FAILED);
+      }
+      // else: keep RECONNECTING state for next retry
+
+      throw error;
+    } finally {
+      this.connectInFlight = false;
+    }
+  }
+
+  disconnect(): void {
+    this.connectionEpoch += 1;
+    this.intentionalClose = true;
+    this.clearReconnectTimer();
+    this.cleanup();
+    this.setState(TransportState.DISCONNECTED);
+    this.emit("close", "Disconnected by user");
+  }
+
+  send(data: string): void {
+    if (!this.dataChannel || this.dataChannel.readyState !== "open") {
+      throw new Error("DataChannel is not open");
+    }
+    const bytes = new TextEncoder().encode(data);
+    if (bytes.length >= DATA_CHANNEL_INBOUND_MAX_BYTES) {
+      throw new MessageTooLargeError();
+    }
+    // Chunk only what cannot go whole: an older gateway closes the session on a chunk frame.
+    const limit =
+      this.peerConnection?.sctp?.maxMessageSize ?? DATA_CHANNEL_CHUNK_SIZE;
+    if (bytes.length <= limit) {
+      this.dataChannel.send(data);
+      return;
+    }
+    for (const frame of this.buildChunkFrames(bytes, limit)) {
+      this.dataChannel.send(frame);
+    }
+  }
+
+  private buildChunkFrames(bytes: Uint8Array, limit: number): string[] {
+    const pieceSize = Math.min(
+      DATA_CHANNEL_CHUNK_SIZE,
+      Math.floor(
+        (limit - DATA_CHANNEL_CHUNK_OVERHEAD) / BASE64_CHARS_PER_GROUP,
+      ) * BASE64_BYTES_PER_GROUP,
+    );
+    const id = ++this.chunkGroupSeq;
+    const count = Math.ceil(bytes.length / pieceSize);
+    const frames: string[] = [];
+    for (let seq = 0; seq < count; seq++) {
+      const piece = bytes.subarray(seq * pieceSize, (seq + 1) * pieceSize);
+      frames.push(
+        JSON.stringify({
+          type: CHUNK_FRAME_TYPE,
+          id,
+          seq,
+          count,
+          b64: this.bytesToBase64(piece),
+        }),
+      );
+    }
+    return frames;
+  }
+
+  private bytesToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += FROM_CHAR_CODE_SLICE) {
+      binary += String.fromCharCode(
+        ...bytes.subarray(i, i + FROM_CHAR_CODE_SLICE),
+      );
+    }
+    return btoa(binary);
+  }
+
+  private setupSignalingHandlers(): void {
+    this.signaling.on("answer", (answer) => {
+      this.handleAnswer(answer);
+    });
+
+    this.signaling.on("ice-candidate", (candidate) => {
+      this.handleIceCandidate(candidate);
+    });
+
+    this.signaling.on("peer-disconnected", () => {
+      this.handlePeerDisconnected();
+    });
+
+    this.signaling.on("error", (error) => {
+      console.error("[WebRTCTransport] Signaling error:", error);
+      this.emit("error", new Error(error));
+    });
+  }
+
+  private createPeerConnection(): void {
+    this.peerConnection = new RTCPeerConnection({
+      iceServers: this.options.tcpRelayOnly ? tcpRelayServers(this.iceServers) : this.iceServers,
+      iceTransportPolicy: this.options.tcpRelayOnly ? "relay" : "all",
+      iceCandidatePoolSize: 0,
+    });
+
+    this.peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.signaling.sendIceCandidate(event.candidate.toJSON());
+      }
+    };
+
+    this.peerConnection.oniceconnectionstatechange = () => {
+      const state = this.peerConnection?.iceConnectionState;
+      // `disconnected` is transient and usually self-heals; only act on the
+      // terminal `failed` state (the browser escalates `disconnected` to it).
+      if (state === "failed") {
+        this.handleConnectionFailure();
+      }
+    };
+
+    this.peerConnection.onconnectionstatechange = () => {
+      const state = this.peerConnection?.connectionState;
+      if (state === "failed") {
+        this.handleConnectionFailure();
+      }
+    };
+  }
+
+  private createDataChannel(): void {
+    this.dataChannel = this.peerConnection!.createDataChannel(
+      this.options.dataChannelLabel,
+      {
+        ordered: true,
+      },
+    );
+
+    this.setupDataChannelHandlers();
+  }
+
+  private setupDataChannelHandlers(): void {
+    if (!this.dataChannel) return;
+
+    this.dataChannel.onopen = () => {
+      this.setState(TransportState.CONNECTED);
+      this.emit("open");
+    };
+
+    this.dataChannel.onclose = () => {
+      console.log("[WebRTCTransport] Data channel closed");
+      if (!this.intentionalClose && this.options.reconnect) {
+        this.scheduleReconnect();
+      } else {
+        this.setState(TransportState.DISCONNECTED);
+        this.emit("close", "Data channel closed");
+      }
+    };
+
+    this.dataChannel.onerror = () => {
+      console.error("[WebRTCTransport] Data channel error");
+      this.emit("error", new Error("Data channel error"));
+    };
+
+    this.dataChannel.onmessage = (event) => {
+      // The server splits oversized messages into "__chunk__" frames; reassemble them
+      // before dispatching. Everything else is a whole message.
+      if (typeof event.data === "string") {
+        try {
+          const frame = JSON.parse(event.data);
+          if (frame.type === CHUNK_FRAME_TYPE) {
+            this.handleChunk(frame);
+            return;
+          }
+        } catch {
+          // not a JSON chunk frame; fall through to normal dispatch
+        }
+      }
+      this.dispatchMessage(event.data);
+    };
+  }
+
+  private dispatchMessage(data: string): void {
+    // HTTP-proxy responses are consumed here; anything else is a normal API message.
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.type === "http-proxy-response") {
+        this.handleHttpProxyResponse(parsed);
+        return;
+      }
+      // open the proxy channel once server_info, the first message on this channel, arrives
+      if (typeof parsed.schema_version === "number" && parsed.schema_version >= 49) {
+        this.maybeOpenHttpProxyChannel();
+      }
+    } catch {
+      // not JSON or not an HTTP proxy response
+    }
+    this.emit("message", data);
+  }
+
+  /**
+   * Handle a message from the http_proxy channel, which carries each proxy response as a
+   * JSON header followed by its body as raw binary frames.
+   */
+  private handleHttpProxyMessage(data: string | ArrayBuffer): void {
+    if (typeof data !== "string") {
+      const pending = this.pendingProxyBody;
+      if (!pending) return;
+      pending.parts.push(new Uint8Array(data));
+      pending.received += data.byteLength;
+      if (pending.received >= pending.size) this.completeHttpProxyBody();
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return; // not JSON; nothing on this channel to dispatch
+    }
+    if (parsed.type !== "http-proxy-response") return;
+    // no point buffering frames for a request that already gave up
+    if (!this.httpProxyCallbacks.has(parsed.id)) return;
+    this.pendingProxyBody = {
+      id: parsed.id,
+      status: parsed.status,
+      headers: parsed.headers,
+      size: parsed.size,
+      parts: [],
+      received: 0,
+    };
+    // an empty body is sent as a header on its own
+    if (parsed.size === 0) this.completeHttpProxyBody();
+  }
+
+  private completeHttpProxyBody(): void {
+    const pending = this.pendingProxyBody;
+    if (!pending) return;
+    this.pendingProxyBody = null;
+    // check for a waiting caller before assembling, which for an image copies real bytes
+    const callbacks = this.httpProxyCallbacks.get(pending.id);
+    if (!callbacks) return;
+    this.httpProxyCallbacks.delete(pending.id);
+    const body = new Uint8Array(pending.received);
+    let offset = 0;
+    for (const part of pending.parts) {
+      body.set(part, offset);
+      offset += part.byteLength;
+    }
+    callbacks.resolve({
+      status: pending.status,
+      headers: pending.headers,
+      body: body.subarray(0, pending.size),
+    });
+  }
+
+  private maybeOpenHttpProxyChannel(): void {
+    if (this.httpProxyChannelRequested) return;
+    this.httpProxyChannelRequested = true;
+    void this.openHttpProxyChannel();
+  }
+
+  private async openHttpProxyChannel(): Promise<void> {
+    try {
+      const channel = await this.openDataChannel(HTTP_PROXY_CHANNEL_LABEL);
+      if (!channel) return;
+      if (!this.httpProxyChannelRequested) {
+        // the connection this channel was opened for is already torn down
+        channel.close();
+        return;
+      }
+      // body frames arrive as raw binary, which must not be surfaced as Blobs
+      channel.binaryType = "arraybuffer";
+      channel.onmessage = (event) => this.handleHttpProxyMessage(event.data);
+      channel.onclose = () => {
+        // a response cut off mid-transfer can never be completed, so drop what it left
+        this.pendingProxyBody = null;
+        if (this.httpProxyChannel === channel) {
+          this.httpProxyChannel = null;
+        }
+        // nothing still in flight here can be answered now, so fail those callers at once
+        // rather than leaving each one waiting out its timeout
+        for (const [id, callbacks] of this.httpProxyCallbacks) {
+          if (!callbacks.onProxyChannel) continue;
+          this.httpProxyCallbacks.delete(id);
+          callbacks.reject(new Error("http_proxy channel closed"));
+        }
+      };
+      this.httpProxyChannel = channel;
+    } catch (error) {
+      // proxying over the API channel remains a working fallback
+      console.warn(
+        "[WebRTCTransport] http_proxy DataChannel unavailable:",
+        error,
+      );
+    }
+  }
+
+  private handleChunk(frame: {
+    id: number;
+    seq: number;
+    count: number;
+    b64: string;
+  }): void {
+    let pending = this.chunkGroups.get(frame.id);
+    if (!pending) {
+      pending = {
+        count: frame.count,
+        parts: Array.from<string>({ length: frame.count }),
+        received: 0,
+      };
+      this.chunkGroups.set(frame.id, pending);
+    }
+    if (pending.parts[frame.seq] === undefined) {
+      pending.received++;
+    }
+    pending.parts[frame.seq] = frame.b64;
+    if (pending.received < pending.count) return;
+
+    this.chunkGroups.delete(frame.id);
+    const bytes = this.base64PartsToBytes(pending.parts);
+    this.dispatchMessage(new TextDecoder().decode(bytes));
+  }
+
+  private base64PartsToBytes(parts: string[]): Uint8Array {
+    const chunks = parts.map((b64) => {
+      const binary = atob(b64);
+      const arr = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
+      return arr;
+    });
+    const total = chunks.reduce((n, c) => n + c.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      out.set(c, offset);
+      offset += c.length;
+    }
+    return out;
+  }
+
+  private async handleAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
+    if (!this.peerConnection) return;
+
+    try {
+      let sdp = answer.sdp;
+
+      // Verify certificate fingerprint from SDP before setting remote description
+      // This happens BEFORE the DTLS handshake, providing early rejection of untrusted peers
+      if (!this.options.skipCertificateVerification) {
+        sdp = verifyAndSanitizeSdp(answer.sdp, this.options.remoteId);
+        console.log("[WebRTCTransport] SDP fingerprint verified");
+      }
+
+      await this.peerConnection.setRemoteDescription(
+        new RTCSessionDescription({ type: answer.type, sdp }),
+      );
+      this.remoteDescriptionSet = true;
+
+      // Process buffered ICE candidates
+      for (const candidate of this.iceCandidateBuffer) {
+        await this.peerConnection.addIceCandidate(
+          new RTCIceCandidate(candidate),
+        );
+      }
+      this.iceCandidateBuffer = [];
+    } catch (error) {
+      if (error instanceof CertificateVerificationError) {
+        console.error(
+          "[WebRTCTransport] Certificate verification failed:",
+          error.message,
+        );
+        this.emit("error", error);
+        this.cleanup();
+        return;
+      }
+      console.error(
+        "[WebRTCTransport] Error setting remote description:",
+        error,
+      );
+    }
+  }
+
+  private async handleIceCandidate(
+    candidate: RTCIceCandidateInit,
+  ): Promise<void> {
+    if (!this.peerConnection) return;
+
+    if (this.remoteDescriptionSet) {
+      try {
+        await this.peerConnection.addIceCandidate(
+          new RTCIceCandidate(candidate),
+        );
+      } catch (error) {
+        console.error("[WebRTCTransport] Error adding ICE candidate:", error);
+      }
+    } else {
+      // Buffer the candidate until remote description is set
+      this.iceCandidateBuffer.push(candidate);
+    }
+  }
+
+  private handlePeerDisconnected(): void {
+    console.log("[WebRTCTransport] Peer disconnected");
+    if (!this.intentionalClose && this.options.reconnect) {
+      this.scheduleReconnect();
+    } else {
+      this.setState(TransportState.DISCONNECTED);
+      this.emit("close", "Peer disconnected");
+      this.cleanup();
+    }
+  }
+
+  private handleConnectionFailure(): void {
+    console.log("[WebRTCTransport] Connection failure detected");
+    if (!this.intentionalClose && this.options.reconnect) {
+      this.scheduleReconnect();
+    } else {
+      this.setState(TransportState.FAILED);
+      this.emit("error", new Error("WebRTC connection failed"));
+      this.cleanup();
+    }
+  }
+
+  private waitForConnection(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.cancelConnectionWait = undefined;
+        reject(new Error("Connection timeout"));
+      }, 30000);
+      this.cancelConnectionWait = error => {
+        clearTimeout(timeout);
+        this.cancelConnectionWait = undefined;
+        reject(error);
+      };
+
+      const checkConnection = () => {
+        if (this.dataChannel?.readyState === "open") {
+          clearTimeout(timeout);
+          this.cancelConnectionWait = undefined;
+          resolve();
+        }
+      };
+
+      // Check if already connected
+      checkConnection();
+
+      // Listen for open event
+      const dataChannel = this.dataChannel;
+      if (dataChannel) {
+        const originalOnOpen = dataChannel.onopen;
+        dataChannel.onopen = (event) => {
+          clearTimeout(timeout);
+          this.cancelConnectionWait = undefined;
+          if (originalOnOpen) {
+            originalOnOpen.call(dataChannel, event);
+          }
+          resolve();
+        };
+      }
+    });
+  }
+
+  /**
+   * Send HTTP proxy request over WebRTC data channel
+   *
+   * :param method: HTTP method (GET, POST, etc.)
+   * :param path: Request path including query string
+   * :param headers: Request headers
+   */
+  async sendHttpProxyRequest(
+    method: string,
+    path: string,
+    headers: Record<string, string> = {},
+  ): Promise<{
+    status: number;
+    headers: Record<string, string>;
+    body: Uint8Array;
+  }> {
+    // Falls back to the API channel when the server has no dedicated proxy channel.
+    const channel =
+      this.httpProxyChannel?.readyState === "open"
+        ? this.httpProxyChannel
+        : this.dataChannel;
+    if (!channel || channel.readyState !== "open") {
+      throw new Error("DataChannel is not open");
+    }
+
+    // Generate unique request ID
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+
+    // Create promise for response
+    const responsePromise = new Promise<{
+      status: number;
+      headers: Record<string, string>;
+      body: Uint8Array;
+    }>((resolve, reject) => {
+      // Store callbacks
+      this.httpProxyCallbacks.set(requestId, {
+        resolve,
+        reject,
+        onProxyChannel: channel === this.httpProxyChannel,
+      });
+
+      // Set timeout
+      setTimeout(() => {
+        if (this.httpProxyCallbacks.has(requestId)) {
+          this.httpProxyCallbacks.delete(requestId);
+          // stop buffering frames nothing is waiting for any more
+          if (this.pendingProxyBody?.id === requestId) {
+            this.pendingProxyBody = null;
+          }
+          reject(new Error("HTTP proxy request timeout"));
+        }
+      }, 30000);
+    });
+
+    // Send request
+    const request = {
+      type: "http-proxy-request",
+      id: requestId,
+      method,
+      path,
+      headers,
+    };
+
+    channel.send(JSON.stringify(request));
+
+    return responsePromise;
+  }
+
+  /**
+   * Handle HTTP proxy response from server
+   */
+  private handleHttpProxyResponse(data: {
+    id: string;
+    status: number;
+    headers: Record<string, string>;
+    body: string;
+  }): void {
+    const { id, status, headers, body } = data;
+
+    const callbacks = this.httpProxyCallbacks.get(id);
+    if (callbacks) {
+      this.httpProxyCallbacks.delete(id);
+
+      try {
+        // Convert hex string to Uint8Array
+        const bodyBytes = this.hexToBytes(body);
+
+        callbacks.resolve({
+          status,
+          headers,
+          body: bodyBytes,
+        });
+      } catch (error) {
+        callbacks.reject(
+          error instanceof Error
+            ? error
+            : new Error("Failed to parse response"),
+        );
+      }
+    }
+  }
+
+  /**
+   * Convert hex string to Uint8Array
+   */
+  private hexToBytes(hex: string): Uint8Array {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+    }
+    return bytes;
+  }
+
+  private scheduleReconnect(): void {
+    // Connection is down; cancel any pending backoff reset before we bail or retry.
+    this.clearStableConnectionTimer();
+
+    // One reconnect at a time: bail if a timer is pending or a connect is in flight.
+    if (this.reconnectTimer || this.connectInFlight) {
+      return;
+    }
+
+    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+      console.error(
+        "[WebRTCTransport] Max reconnect attempts reached, giving up",
+      );
+      this.setState(TransportState.FAILED);
+      return;
+    }
+
+    this.setState(TransportState.RECONNECTING);
+    this.emit("close", "Connection lost, reconnecting...");
+
+    // First retry is immediate; later ones back off with jitter so reconnects don't line up.
+    let delay = 0;
+    if (this.reconnectAttempts > 0) {
+      const backoff = Math.min(
+        this.options.reconnectDelay *
+          Math.pow(this.options.reconnectDelayGrowth, this.reconnectAttempts),
+        this.options.maxReconnectDelay,
+      );
+      delay = Math.round(backoff * (0.5 + Math.random() * 0.5));
+    }
+
+    console.log(
+      `[WebRTCTransport] Scheduling reconnect attempt ${this.reconnectAttempts + 1} in ${delay}ms`,
+    );
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      this.reconnectAttempts++;
+      // Clean up old connection first
+      this.cleanup();
+      // Attempt reconnection
+      try {
+        await this.connect();
+      } catch (error) {
+        console.error("[WebRTCTransport] Reconnect attempt failed:", error);
+        // Schedule another reconnect attempt
+        if (!this.intentionalClose && this.options.reconnect) {
+          this.scheduleReconnect();
+        }
+      }
+    }, delay);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private scheduleBackoffReset(): void {
+    this.clearStableConnectionTimer();
+    this.stableConnectionTimer = setTimeout(() => {
+      this.reconnectAttempts = 0;
+      this.stableConnectionTimer = null;
+    }, STABLE_CONNECTION_THRESHOLD_MS);
+  }
+
+  private clearStableConnectionTimer(): void {
+    if (this.stableConnectionTimer) {
+      clearTimeout(this.stableConnectionTimer);
+      this.stableConnectionTimer = null;
+    }
+  }
+
+  private cleanup(): void {
+    this.cancelConnectionWait?.(new Error("WebRTC connection closed"));
+    // Cancel the pending backoff reset so it can't fire after teardown.
+    this.clearStableConnectionTimer();
+
+    if (this.dataChannel) {
+      // Detach first so our own close doesn't fire onclose -> scheduleReconnect (the loop).
+      this.dataChannel.onopen = null;
+      this.dataChannel.onclose = null;
+      this.dataChannel.onerror = null;
+      this.dataChannel.onmessage = null;
+      this.dataChannel.close();
+      this.dataChannel = null;
+    }
+
+    if (this.httpProxyChannel) {
+      this.httpProxyChannel.onopen = null;
+      this.httpProxyChannel.onclose = null;
+      this.httpProxyChannel.onerror = null;
+      this.httpProxyChannel.onmessage = null;
+      this.httpProxyChannel.close();
+      this.httpProxyChannel = null;
+    }
+    this.httpProxyChannelRequested = false;
+
+    if (this.peerConnection) {
+      // Detach first so close doesn't re-enter handleConnectionFailure().
+      this.peerConnection.onicecandidate = null;
+      this.peerConnection.oniceconnectionstatechange = null;
+      this.peerConnection.onconnectionstatechange = null;
+      this.peerConnection.close();
+      this.peerConnection = null;
+    }
+
+    this.signaling.disconnect();
+    this.remoteDescriptionSet = false;
+    this.iceCandidateBuffer = [];
+
+    // Clear pending HTTP proxy requests
+    for (const [, callbacks] of this.httpProxyCallbacks.entries()) {
+      callbacks.reject(new Error("Transport closed"));
+    }
+    this.httpProxyCallbacks.clear();
+    this.chunkGroups.clear();
+    this.pendingProxyBody = null;
+  }
+
+  /**
+   * Open an additional DataChannel alongside the API one, so a feature can use
+   * the existing WebRTC connection for its own stream.
+   *
+   * @param label - Channel label the server routes on, e.g. "sendspin".
+   */
+  async openDataChannel(label: string): Promise<RTCDataChannel | null> {
+    if (!this.peerConnection) {
+      console.warn(
+        `[WebRTCTransport] Cannot create ${label} channel: no peer connection`,
+      );
+      return null;
+    }
+
+    if (
+      this.peerConnection.connectionState !== "connected" &&
+      this.peerConnection.connectionState !== "connecting"
+    ) {
+      console.warn(
+        `[WebRTCTransport] Cannot create ${label} channel: connection state is`,
+        this.peerConnection.connectionState,
+      );
+      return null;
+    }
+
+    console.debug(`[WebRTCTransport] Creating ${label} DataChannel`);
+
+    // Ordered for TCP-like behavior
+    const channel = this.peerConnection.createDataChannel(label, {
+      ordered: true,
+    });
+
+    // Wait for the channel to open
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        console.warn(`[WebRTCTransport] ${label} DataChannel open timeout`);
+        reject(new Error(`${label} DataChannel open timeout`));
+      }, 10000);
+
+      channel.onopen = () => {
+        clearTimeout(timeout);
+        console.debug(`[WebRTCTransport] ${label} DataChannel opened`);
+        resolve(channel);
+      };
+
+      channel.onerror = (event) => {
+        clearTimeout(timeout);
+        console.error(`[WebRTCTransport] ${label} DataChannel error:`, event);
+        reject(new Error(`${label} DataChannel error`));
+      };
+
+      // If channel is already open (unlikely but possible), resolve immediately
+      if (channel.readyState === "open") {
+        clearTimeout(timeout);
+        resolve(channel);
+      }
+    });
+  }
+}

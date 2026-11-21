@@ -85,6 +85,10 @@ input[type="range"] {
 }
 
 button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   min-height: 46px;
   color: #07110d;
   border: 0;
@@ -93,6 +97,9 @@ button {
   font: inherit;
   font-weight: 800;
 }
+
+button:disabled { opacity: 0.5; }
+.auth-actions { display: grid; grid-template-columns: minmax(0, 1fr) 46px; gap: 10px; }
 
 button[type="button"] {
   color: #d7dce4;

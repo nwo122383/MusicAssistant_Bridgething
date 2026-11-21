@@ -6,7 +6,13 @@
     <title>Music Assistant Settings</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"><main id="settings-boot"><h1>Music Assistant</h1><p>Loading settings...</p></main></div>
+    <script>
+      window.addEventListener("error", function () {
+        var boot = document.getElementById("settings-boot");
+        if (boot) boot.textContent = "Music Assistant settings could not load. Close and reopen this page.";
+      });
+    </script>
     <script type="module" src="/main.tsx"></script>
   </body>
 </html>

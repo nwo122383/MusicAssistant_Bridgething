@@ -23,6 +23,8 @@ export interface MediaItem {
 }
 
 export interface Player {
+  provider?: string;
+  device_info?: { model?: string; manufacturer?: string };
   player_id: string;
   display_name?: string;
   name: string;
@@ -33,6 +35,19 @@ export interface Player {
   state?: string;
   active_source?: string;
   group_childs?: string[];
+}
+
+export interface GroupPlayer extends Player {
+  provider?: string;
+  type?: string;
+  enabled?: boolean;
+  supported_features?: string[];
+  group_members?: string[];
+  static_group_members?: string[];
+  can_group_with?: string[];
+  synced_to?: string | null;
+  active_group?: string | null;
+  playback_player_id?: string;
 }
 
 export interface QueueItem {
@@ -70,8 +85,9 @@ export interface MassEvent {
 
 export interface ConnectionConfig {
   serverUrl: string;
+  remoteId?: string;
   token?: string;
-  transport?: "direct" | "bridgething" | "homeassistant";
+  transport?: "direct" | "bridgething" | "homeassistant" | "webrtc";
 }
 
 export interface Preset {

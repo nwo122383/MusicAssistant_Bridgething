@@ -1,4 +1,5 @@
 import type { MassImage, MediaItem, QueueItem } from "../types";
+import { REMOTE_ARTWORK_BASE } from "./remoteArtwork";
 
 function isValidImage(img?: any): boolean {
   if (!img) return false;
@@ -46,15 +47,23 @@ export function imageUrl(serverUrl: string, image?: MassImage | string, size = 5
     // enough to avoid closing the data channel on Car Thing.
     normalizedSize = Math.min(normalizedSize, 160);
   }
-  if (typeof image === "string") return normalizeStringImageUrl(image, normalizedSize, cacheKey);
+  if (typeof image === "string") return normalizeStringImageUrl(remoteImageUrl(base, image), normalizedSize, cacheKey);
   if (image.proxy_id) {
     return appendCacheKey(`${base}/imageproxy/${encodeURIComponent(image.proxy_id)}?size=${normalizedSize}`, cacheKey);
   }
   if (image.path) {
     return appendCacheKey(`${base}/imageproxy?path=${encodeURIComponent(encodeURIComponent(image.path))}&provider=${encodeURIComponent(image.provider)}&size=${normalizedSize}`, cacheKey);
   }
-  if (image.url) return appendCacheKey(image.url, cacheKey);
+  if (image.url) return appendCacheKey(remoteImageUrl(base, image.url), cacheKey);
   return "";
+}
+
+function remoteImageUrl(base: string, image: string): string {
+  if (base !== REMOTE_ARTWORK_BASE) return image;
+  try {
+    const url = new URL(image, base);
+    return url.pathname.startsWith("/imageproxy") ? `${base}${url.pathname}${url.search}` : image;
+  } catch { return ""; }
 }
 
 function normalizeStringImageUrl(image: string, size: number, cacheKey?: string): string {

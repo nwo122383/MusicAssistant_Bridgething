@@ -6,6 +6,7 @@ const PLAYER_KEY = "carthing-ma-player-v1";
 const DISPLAY_SIZE_KEY = "carthing-ma-display-size-v1";
 const NOW_PLAYING_TEXT_SIZE_KEY = "carthing-ma-now-playing-text-size-v1";
 const BRIGHTNESS_KEY = "carthing-ma-brightness-v1";
+const PHONE_VOLUME_PLAYER_KEY = "carthing-ma-phone-volume-player-v1";
 
 export type DisplaySize = "standard" | "large" | "xlarge";
 export type NowPlayingTextSize = "small" | "medium" | "large" | "xlarge";
@@ -38,6 +39,8 @@ export const savePresets = (presets: Preset[]): void =>
 
 export const loadPlayerId = (): string => localStorage.getItem(PLAYER_KEY) || "";
 export const savePlayerId = (id: string): void => localStorage.setItem(PLAYER_KEY, id);
+export const loadPhoneVolumePlayerId = (): string => localStorage.getItem(PHONE_VOLUME_PLAYER_KEY) || "";
+export const savePhoneVolumePlayerId = (id: string): void => localStorage.setItem(PHONE_VOLUME_PLAYER_KEY, id);
 export const loadDisplaySize = (): DisplaySize => {
   const value = localStorage.getItem(DISPLAY_SIZE_KEY);
   return value === "large" || value === "xlarge" ? value : "standard";

@@ -43,6 +43,7 @@ export function useHardware(handlers: HardwareHandlers): void {
     const longPressed = new Set<string>();
 
     const onWheel = (event: WheelEvent) => {
+      if (event.target instanceof Element && event.target.closest("[data-hardware-scroll]")) return;
       event.preventDefault();
       const delta = event.deltaX || event.deltaY;
       if (delta < 0) latest.current.dialLeft();

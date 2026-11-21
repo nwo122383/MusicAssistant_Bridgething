@@ -1,6 +1,9 @@
-import type { MassEvent, MassImage, MediaItem, Player, PlayerQueue, QueueItem } from "../types";
+import type { GroupPlayer, MassEvent, MassImage, MediaItem, Player, PlayerQueue, QueueItem } from "../types";
+import { membershipChanges, ungroupTargets } from "./playerGroups";
+import { createWebRtcSocket } from "./WebRtcSocket";
+import { setRemoteArtworkLoader } from "./remoteArtwork";
 
-type MassTransport = "direct" | "bridgething" | "homeassistant";
+type MassTransport = "direct" | "bridgething" | "homeassistant" | "webrtc";
 
 const HA_CONNECT_TIMEOUT_MS = 30_000;
 const HA_COMMAND_TIMEOUT_MS = 12_000;
@@ -30,6 +33,8 @@ export class MassClient {
   private sequence = 0;
   private haSequence = 0;
   private serverReady?: () => void;
+  private connectionEpoch = 0;
+  private cancelConnection?: () => void;
   private protocol: "mass" | "ha" = "mass";
   private haBaseUrl = "";
   private haStates = new Map<string, HaState>();
@@ -37,9 +42,12 @@ export class MassClient {
   private haRefreshInFlight?: Promise<void>;
   private haHydratedQueues = new Map<string, PlayerQueue>();
   private haQueueHydrationSequence = new Map<string, number>();
+  private haIngress?: { url: string; session: string; expires: number };
+  private haPlayerEntityMap?: Map<string, string>;
 
-  async connect(serverUrl: string, token?: string, transport: MassTransport = "direct"): Promise<void> {
+  async connect(serverUrl: string, token?: string, transport: MassTransport = "direct", options: { tcpRelayOnly?: boolean } = {}): Promise<void> {
     this.disconnect();
+    const epoch = this.connectionEpoch;
     const base = serverUrl.replace(/\/$/, "");
     if (transport === "homeassistant") {
       await this.connectHomeAssistant(base, token);
@@ -55,22 +63,27 @@ export class MassClient {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        const socket = this.socket;
-        this.socket = undefined;
-        socket?.close();
-        this.rejectPending(error);
+        if (epoch === this.connectionEpoch) {
+          this.cancelConnection = undefined;
+          const socket = this.socket;
+          this.socket = undefined;
+          socket?.close();
+          this.rejectPending(error);
+        }
         reject(error);
       };
       const handleClose = () => {
+        if (epoch !== this.connectionEpoch) return;
+        if (!settled) fail(new Error("Music Assistant connection closed"));
+        const socket = this.socket;
         this.socket = undefined;
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-        }
+        socket?.close();
+        if (transport === "webrtc") setRemoteArtworkLoader(undefined);
         this.rejectPending(new Error("Music Assistant connection closed"));
         this.closeListeners.forEach((listener) => listener());
       };
       const handleMessage = (rawData: string) => {
+        if (epoch !== this.connectionEpoch) return;
         const data = JSON.parse(rawData) as Record<string, unknown>;
         if ("server_id" in data && "server_version" in data) {
           this.serverReady?.();
@@ -84,13 +97,19 @@ export class MassClient {
       };
       timeout = window.setTimeout(() => {
         fail(new Error("Music Assistant did not respond"));
-      }, 12_000);
+      }, transport === "webrtc" ? 75_000 : 12_000);
 
       this.serverReady = async () => {
+        if (settled || epoch !== this.connectionEpoch) return;
         try {
           if (token) await this.command("auth", { token, device_name: "Car Thing" });
           if (!settled) {
+            if (transport === "webrtc") {
+              const socket = this.socket as ReturnType<typeof createWebRtcSocket>;
+              setRemoteArtworkLoader(path => socket.fetchImage(path, token));
+            }
             settled = true;
+            this.cancelConnection = undefined;
             clearTimeout(timeout);
             resolve();
           }
@@ -98,6 +117,21 @@ export class MassClient {
           fail(error instanceof Error ? error : new Error(String(error)));
         }
       };
+      this.cancelConnection = () => fail(new Error("Connection replaced"));
+
+      if (transport === "webrtc") {
+        try {
+          const socket = createWebRtcSocket(serverUrl, handleMessage, handleClose, error => {
+            if (settled) handleClose();
+            else fail(error);
+          }, options.tcpRelayOnly ?? true);
+          this.socket = socket;
+          void socket.ready.catch(error => fail(error instanceof Error ? error : new Error(String(error))));
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error(String(error)));
+        }
+        return;
+      }
 
       if (transport === "bridgething") {
         const socket = createBridgeThingSocket(wsUrl, handleMessage, handleClose);
@@ -165,7 +199,57 @@ export class MassClient {
     return this.socket?.isOpen() === true;
   }
 
+  async nativePlayerCommand<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T> {
+    if (command === "players/cmd/set_members" || command === "players/cmd/ungroup") this.haPlayerEntityMap = undefined;
+    return this.protocol === "ha" ? await this.haMassCommand(command, args) as T : this.command<T>(command, args);
+  }
+
+  async getGroupPlayers(mapPlayback = true): Promise<GroupPlayer[]> {
+    const players = await this.nativePlayerCommand<GroupPlayer[]>("players/all", { return_unavailable: true, return_disabled: true });
+    if (!mapPlayback) return players;
+    if (this.protocol !== "ha") return players.map(p => ({ ...p, playback_player_id: p.player_id }));
+    if (!this.haPlayerEntityMap) {
+      const registry = await this.haRequest<Array<{ entity_id: string; unique_id: string; platform: string; config_entry_id?: string }>>("config/entity_registry/list");
+      this.haPlayerEntityMap = new Map(registry.filter(entry => entry.platform === "music_assistant" &&
+        (!entry.config_entry_id || entry.config_entry_id === this.haMassConfigEntryId)).map(entry => [entry.unique_id, entry.entity_id]));
+    }
+    const entityMap = this.haPlayerEntityMap!;
+    return players.map(player => ({
+      ...player,
+      playback_player_id: entityMap.get(player.player_id) ?? entityMap.get(`mass_${player.player_id}`),
+    }));
+  }
+
+  async setGroupMembers(playerId: string, desired: string[], baseline: string[]): Promise<void> {
+    const player = (await this.getGroupPlayers(false)).find(p => p.player_id === playerId);
+    if (!player?.available) throw new Error("The group leader is unavailable");
+    const { add, remove } = membershipChanges(player, desired, baseline);
+    if (!add.length && !remove.length) return;
+    await this.nativePlayerCommand("players/cmd/set_members", {
+      target_player: playerId, player_ids_to_add: add, player_ids_to_remove: remove,
+    });
+  }
+
+  async ungroupAllPlayers(): Promise<{ attempted: number; failed: string[] }> {
+    const targets = ungroupTargets(await this.getGroupPlayers(false));
+    const failed: string[] = [];
+    for (const player of targets) {
+      try {
+        await this.nativePlayerCommand("players/cmd/ungroup", { player_id: player.player_id });
+      } catch {
+        failed.push(player.display_name || player.name);
+      }
+    }
+    return { attempted: targets.length, failed };
+  }
+
   disconnect(): void {
+    this.connectionEpoch += 1;
+    this.cancelConnection?.();
+    this.cancelConnection = undefined;
+    setRemoteArtworkLoader(undefined);
+    this.haPlayerEntityMap = undefined;
+    this.haIngress = undefined;
     this.socket?.close();
     this.socket = undefined;
     this.haStates.clear();
@@ -362,6 +446,7 @@ export class MassClient {
   }
 
   private async haCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+    if (command.startsWith("ai_radio/")) return await this.haAiRadioCommand(command, args) as T;
     if (command === "players/all") {
       await this.refreshHaTrackedStates();
       return this.haPlayers() as T;
@@ -515,6 +600,67 @@ export class MassClient {
     });
   }
 
+  private async haAiRadioCommand(command: string, args?: Record<string, unknown>): Promise<unknown> {
+    const serviceArgs = { ...args };
+    if (typeof serviceArgs.player_id_override === "string" && serviceArgs.player_id_override.startsWith("media_player.")) {
+      const entityId = serviceArgs.player_id_override;
+      const response = await this.getHaQueue(entityId);
+      const queue = this.extractHaQueueEntry(response, entityId);
+      const playerId = queue?.queue_id ?? queue?.player_id;
+      if (typeof playerId !== "string" || playerId.startsWith("media_player.")) {
+        throw new Error("Unable to resolve the selected Music Assistant player for AI Radio");
+      }
+      serviceArgs.player_id_override = playerId;
+    }
+    return this.haMassCommand(command, serviceArgs);
+  }
+
+  private async haMassCommand(command: string, serviceArgs?: Record<string, unknown>): Promise<unknown> {
+    const feature = command.startsWith("ai_radio/") ? "AI Radio" : "Player groups";
+    if (!this.haIngress || this.haIngress.expires < Date.now()) {
+      const panels = await this.haRequest<Record<string, { config?: { addon?: string }; title?: string }>>("get_panels");
+      const candidates = Object.values(panels).filter((panel) => panel.config?.addon && /music.?assistant/i.test(`${panel.title} ${panel.config.addon}`));
+      if (candidates.length !== 1) throw new Error(`${feature} needs a single Music Assistant add-on with Home Assistant ingress enabled`);
+      const slug = candidates[0].config!.addon!;
+      const [info, session] = await Promise.all([
+        this.haRequest<{ ingress_url?: string }>("supervisor/api", { endpoint: `/addons/${slug}/info`, method: "get" }),
+        this.haRequest<{ session: string }>("supervisor/api", { endpoint: "/ingress/session", method: "post" }),
+      ]);
+      if (!info.ingress_url || !session.session) throw new Error("Music Assistant ingress is unavailable");
+      const url = new URL(`${info.ingress_url.replace(/\/$/, "")}/api`, this.haBaseUrl);
+      if (url.origin !== new URL(this.haBaseUrl).origin || !url.pathname.startsWith("/api/hassio_ingress/")) {
+        throw new Error("Invalid Music Assistant ingress route");
+      }
+      this.haIngress = { url: url.href, session: session.session, expires: Date.now() + 60_000 };
+    }
+    const ingress = this.haIngress;
+    const bridge = await importBridgeThingClient();
+    try {
+      const result = await bridge.net.fetch({ request: {
+        url: ingress.url,
+        method: "POST",
+        headers: [
+          { name: "Cookie", value: `ingress_session=${ingress.session}` },
+          { name: "Content-Type", value: "application/json" },
+        ],
+        body: new TextEncoder().encode(JSON.stringify({ message_id: `ai-${++this.sequence}`, command, args: serviceArgs })),
+        timeoutMs: 25_000,
+        redirect: "error",
+      } }, { timeoutMs: 30_000 });
+      if (!result.ok) throw new Error(`${feature} request failed through the BridgeThing companion`);
+      const response = result.response.response;
+      if (response.status < 200 || response.status >= 300) {
+        if (response.status === 401 || response.status === 403) this.haIngress = undefined;
+        throw new Error(response.status === 400 || response.status === 404
+          ? `${feature} command was rejected by Music Assistant. Refresh and try again.`
+          : `${feature} request failed (${response.status})`);
+      }
+      return JSON.parse(new TextDecoder().decode(response.body));
+    } finally {
+      bridge.close();
+    }
+  }
+
   private async haSearch(args?: Record<string, unknown>): Promise<Record<string, MediaItem[]>> {
     const searchQuery = String(args?.search_query || args?.name || "").trim();
     if (!searchQuery) return {};
@@ -535,6 +681,7 @@ export class MassClient {
       "music/albums/library_items": "album",
       "music/artists/library_items": "artist",
       "music/radios/library_items": "radio",
+      "music/tracks/library_items": "track",
       "music/recently_played_items": "track",
     };
     const mediaType = mediaTypeByCommand[command];
@@ -546,7 +693,7 @@ export class MassClient {
       offset: Number(args?.offset || 0),
       favorite: args?.favorite === null ? undefined : args?.favorite,
       search: typeof args?.search === "string" ? args.search : undefined,
-      order_by: command === "music/recently_played_items" ? "name" : undefined,
+      order_by: typeof args?.order_by === "string" ? args.order_by : command === "music/recently_played_items" ? "name" : undefined,
     });
     return this.normalizeHaMediaItems((response as { items?: unknown })?.items ?? response, mediaType);
   }
@@ -638,7 +785,8 @@ export class MassClient {
       await this.callHaAction("music_assistant", "play_media", queueId, {
         media_id: args?.media,
         media_type: args?.media_type || "track",
-        enqueue: "replace",
+        enqueue: args?.option || args?.enqueue || "replace",
+        radio_mode: args?.radio_mode === true ? true : undefined,
       }, false);
       return;
     }

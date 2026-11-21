@@ -1,28 +1,31 @@
-import { render } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useHardware } from "./useHardware";
 
 function Harness({
   presetLongPress = vi.fn(),
   presetPress,
+  dialRight = vi.fn(),
 }: {
   presetLongPress?: (slot: number) => void;
   presetPress: (slot: number) => void;
+  dialRight?: () => void;
 }) {
   useHardware({
     dialLeft: vi.fn(),
-    dialRight: vi.fn(),
+    dialRight,
     dialPress: vi.fn(),
     presetPress,
     presetLongPress,
     back: vi.fn(),
     settings: vi.fn(),
   });
-  return <input aria-label="Password" type="password" />;
+  return <div data-hardware-scroll><input aria-label="Password" type="password" /></div>;
 }
 
 describe("Car Thing hardware shortcuts", () => {
   afterEach(() => {
+    cleanup();
     window.history.replaceState(null, "", "/");
     vi.useRealTimers();
   });
@@ -92,5 +95,25 @@ describe("Car Thing hardware shortcuts", () => {
 
     expect(presetLongPress).toHaveBeenCalledWith(4);
     expect(presetPress).not.toHaveBeenCalled();
+  });
+
+  it("leaves wheel events inside a scroll area available for native scrolling", () => {
+    const dialRight = vi.fn();
+    const view = render(<Harness presetPress={vi.fn()} dialRight={dialRight} />);
+    const event = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 72 });
+    view.getByLabelText("Password").dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(dialRight).not.toHaveBeenCalled();
+    view.unmount();
+  });
+
+  it("still routes dial wheel events outside scroll areas to the active handler", () => {
+    const dialRight = vi.fn();
+    const view = render(<Harness presetPress={vi.fn()} dialRight={dialRight} />);
+    const event = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 72 });
+    document.body.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(dialRight).toHaveBeenCalledOnce();
+    view.unmount();
   });
 });

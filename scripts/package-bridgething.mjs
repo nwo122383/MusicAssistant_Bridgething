@@ -1,9 +1,10 @@
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
 import { deflateRawSync } from "node:zlib";
+import { fileURLToPath } from "node:url";
 import packageJson from "../package.json" with { type: "json" };
 
-const root = new URL("..", import.meta.url).pathname;
+const root = fileURLToPath(new URL("..", import.meta.url));
 const distDir = join(root, "dist");
 const releaseDir = join(root, "release");
 const packageBase = packageJson.name.endsWith("-bridgething") ? packageJson.name : `${packageJson.name}-bridgething`;
@@ -131,6 +132,13 @@ async function buildZip(files) {
 const files = (await listFiles(distDir)).filter((file) => !file.endsWith(".map")).sort();
 if (!files.some((file) => basename(file) === "manifest.json")) {
   throw new Error("dist/manifest.json is missing. Run npm run build:bridgething first.");
+}
+
+const manifest = JSON.parse(await readFile(join(distDir, "manifest.json"), "utf8"));
+if (manifest.version !== packageJson.version) throw new Error("Built manifest and package versions differ. Rebuild before packaging.");
+if (manifest.settings) {
+  const settingsPath = join(distDir, manifest.settings);
+  if ((await stat(settingsPath)).size > 1024 * 1024) throw new Error("Settings page exceeds BridgeThing's 1 MiB limit.");
 }
 
 await mkdir(releaseDir, { recursive: true });

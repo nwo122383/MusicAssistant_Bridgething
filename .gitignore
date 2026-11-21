@@ -13,3 +13,7 @@ tools/*.exe
 android-relay/.gradle/
 android-relay/build/
 android-relay/app/build/
+phone-player/.gradle/
+phone-player/build/
+phone-player/app/build/
+phone-player/local.properties

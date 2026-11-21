@@ -28,28 +28,39 @@ import {
   Volume2,
 } from "lucide-react";
 import { useHardware } from "./hooks/useHardware";
+import { PlayersView } from "./components/PlayersView";
 import {
   applyBridgeThingBrightness,
+  connectBridgeThingPhoneVolume,
+  setBridgeThingPhoneVolumePlayer,
   isBridgeThingRuntime,
   loadBridgeThingPreferences,
   readBridgeThingBrightness,
+  subscribeBridgeThingBluetooth,
   subscribeBridgeThingConfig,
   subscribeBridgeThingDocs,
+  subscribeBridgeThingVoice,
 } from "./lib/bridgething";
 import { imageUrl, itemImage } from "./lib/images";
 import { MassClient } from "./lib/MassClient";
+import { connectionTarget, normalizeRemoteId, validateConnection } from "./lib/connection";
+import { REMOTE_ARTWORK_BASE, useArtworkUrl } from "./lib/remoteArtwork";
+import { fetchLibraryPage, LibraryCache, libraryKey, type LibraryKind } from "./lib/library";
+import { currentPlayer, nextPlayerId } from "./lib/phonePlayer";
 import {
   loadBrightnessPreference,
   loadConfig,
   loadDisplaySize,
   loadNowPlayingTextSize,
   loadPlayerId,
+  loadPhoneVolumePlayerId,
   loadPresets,
   saveBrightnessPreference,
   saveConfig,
   saveDisplaySize,
   saveNowPlayingTextSize,
   savePlayerId,
+  savePhoneVolumePlayerId,
   savePresets,
 } from "./lib/storage";
 import type { BrightnessPreference, DisplaySize, NowPlayingTextSize } from "./lib/storage";
@@ -63,17 +74,27 @@ import type {
   Preset,
   QueueItem,
 } from "./types";
+import type { VoiceActivity, VoiceIntent } from "@bridgething/client";
 
 type View = "now" | "library" | "players" | "queue" | "settings";
-type LibraryKind = "recent" | "playlists" | "albums" | "artists" | "radio";
+type MediaLibraryKind = Exclude<LibraryKind, "recent" | "ai_radio">;
 type RepeatMode = "off" | "all" | "one";
-const LIBRARY_PAGE_SIZE = 100;
+type PlayMediaOptions = {
+  shuffle?: boolean;
+  radioMode?: boolean;
+  replaceAiRadio?: boolean;
+};
 const VOLUME_COMMAND_DELAY_MS = 500;
 const VOLUME_OVERLAY_HIDE_MS = 3_000;
 const PLAYING_POSITION_FRESH_MS = 15_000;
 const EXTERNAL_PLAYBACK_REFRESH_MS = 4_000;
+const STALE_CONNECTION_RECONNECT_MS = 18_000;
+const BRIDGETHING_RELOAD_AFTER_STALE_MS = 75_000;
 const SIDE_BY_SIDE_PATH = "/music-assistant";
 const AUTO_RELOAD_STORAGE_KEY = "carthing-ma-last-auto-reload";
+const VOICE_COMMAND_FRESH_MS = 12_000;
+const VOICE_DEBUG_STORAGE_KEY = "carthing-ma-last-voice-debug";
+const VOICE_ARTIST_TRACK_LIMIT = 25;
 
 function isSideBySideInstall(): boolean {
   return window.location.pathname === SIDE_BY_SIDE_PATH || window.location.pathname.startsWith(`${SIDE_BY_SIDE_PATH}/`);
@@ -81,6 +102,20 @@ function isSideBySideInstall(): boolean {
 
 function isLocalRelayUrl(serverUrl: string): boolean {
   return serverUrl.includes("127.0.0.1:4173") || serverUrl.includes("localhost:4173");
+}
+
+function saveVoiceDebug(payload: Record<string, unknown>): void {
+  try {
+    window.localStorage.setItem(
+      VOICE_DEBUG_STORAGE_KEY,
+      JSON.stringify({
+        at: new Date().toISOString(),
+        ...payload,
+      }),
+    );
+  } catch {
+    // Debug storage is best effort only.
+  }
 }
 
 function urlLabel(transport: ConnectionConfig["transport"]): string {
@@ -99,14 +134,17 @@ function returnToNocturne(): void {
   window.location.assign("/?carthingMaBypass=1");
 }
 
-const libraryCommands: Record<Exclude<LibraryKind, "recent">, string> = {
+const libraryCommands: Record<MediaLibraryKind, string> = {
   playlists: "music/playlists/library_items",
   albums: "music/albums/library_items",
   artists: "music/artists/library_items",
   radio: "music/radios/library_items",
 };
 
+const voiceLibraryOrder: MediaLibraryKind[] = ["radio", "artists", "playlists", "albums"];
+
 function itemSubtitle(item: MediaItem): string {
+  if (item.media_type === "ai_radio") return "AI Radio show";
   if (item.artists?.length) return item.artists.map((artist) => artist.name).join(", ");
   return item.owner || item.media_type.replace(/_/g, " ");
 }
@@ -126,6 +164,136 @@ function artworkCacheKey(item?: QueueItem): string | undefined {
     media?.artists?.map((artist) => artist.name).join(","),
     media?.album?.name,
   ].filter(Boolean).join("|") || undefined;
+}
+
+function normalizeMatchText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function scoreMatch(query: string, candidate: string): number {
+  const normalizedQuery = normalizeMatchText(query);
+  const normalizedCandidate = normalizeMatchText(candidate);
+  if (!normalizedQuery || !normalizedCandidate) return 0;
+  if (normalizedCandidate === normalizedQuery) return 100;
+  if (normalizedCandidate.includes(normalizedQuery)) return 85;
+  if (normalizedQuery.includes(normalizedCandidate)) return 70;
+  const queryWords = new Set(normalizedQuery.split(" "));
+  const candidateWords = new Set(normalizedCandidate.split(" "));
+  let overlap = 0;
+  queryWords.forEach((word) => {
+    if (candidateWords.has(word)) overlap += 1;
+  });
+  return Math.round((overlap / Math.max(1, queryWords.size)) * 60);
+}
+
+function findBestPlayer(players: Player[], query: string): Player | undefined {
+  const ranked = players
+    .map((player) => ({
+      player,
+      score: Math.max(scoreMatch(query, player.display_name || ""), scoreMatch(query, player.name)),
+    }))
+    .filter((entry) => entry.score >= 45)
+    .sort((a, b) => b.score - a.score);
+  return ranked[0]?.player;
+}
+
+function rankBestMedia(items: MediaItem[], query: string): { item: MediaItem; score: number } | undefined {
+  const ranked = items
+    .map((item) => ({
+      item,
+      score: scoreMatch(query, item.name) + (item.media_type === "radio" ? 8 : 0),
+    }))
+    .filter((entry) => entry.score >= 45)
+    .sort((a, b) => b.score - a.score);
+  return ranked[0];
+}
+
+function findBestMedia(items: MediaItem[], query: string): MediaItem | undefined {
+  return rankBestMedia(items, query)?.item;
+}
+
+function artistMatches(item: MediaItem, artistName: string): boolean {
+  const query = normalizeMatchText(artistName);
+  if (!query) return false;
+  return (item.artists ?? []).some((artist) => {
+    const name = normalizeMatchText(artist.name);
+    return name === query || name.includes(query) || query.includes(name);
+  });
+}
+
+function voiceLibraryKinds(targetType?: string): MediaLibraryKind[] {
+  if (targetType === "station") return ["radio"];
+  if (targetType === "artist") return ["artists"];
+  if (targetType === "playlist") return ["playlists"];
+  if (targetType === "album") return ["albums"];
+  return voiceLibraryOrder;
+}
+
+function splitPlayerTarget(value: string): { mediaQuery: string; playerQuery?: string } {
+  const parts = value.split(/\s+on\s+/i);
+  if (parts.length < 2) return { mediaQuery: value.trim() };
+  return {
+    mediaQuery: parts[0].trim(),
+    playerQuery: parts.slice(1).join(" on ").replace(/\s+and\s+.+$/i, "").trim(),
+  };
+}
+
+function voiceMediaAlias(value: string): string {
+  const normalized = normalizeMatchText(value);
+  if (["rock bar", "rock band", "rock bark", "rock bard"].includes(normalized)) return "RockBar";
+  if (["joe bonemasa", "joe bonamasa", "joe bonamassa"].includes(normalized)) return "Joe Bonamassa";
+  if (["eric johansson", "eric johanson"].includes(normalized)) return "Eric Johanson";
+  return value;
+}
+
+function voiceTargetType(value: string | null | undefined): string | undefined {
+  const normalized = normalizeMatchText(value || "");
+  if (normalized === "playlist" || normalized === "playlists") return "playlist";
+  if (normalized === "album" || normalized === "albums") return "album";
+  if (normalized === "artist" || normalized === "artists") return "artist";
+  if (normalized === "radio" || normalized === "station" || normalized === "stations") return "station";
+  return undefined;
+}
+
+function parseVoicePlayCommand(input: VoiceIntent | VoiceActivity): { mediaQuery: string; playerQuery?: string; targetType?: string } | undefined {
+  const slots = input.slots ?? {};
+  const transcript = input.transcript?.trim() || "";
+  const slotTarget = slots.target || slots.playlist || "";
+  const transcriptMatch =
+    transcript.match(/\b(?:play|clay|plan)\s+(.+)$/i) ??
+    transcript.match(/^\s*((?:playlist|album|artist|radio|station)\b.+)$/i);
+  const fromTranscript = transcriptMatch?.[1]?.trim() || "";
+  const splitTarget = splitPlayerTarget(fromTranscript);
+  const playerTarget = fromTranscript ? splitTarget.playerQuery : undefined;
+  const rawMediaQuery = slotTarget || splitTarget.mediaQuery;
+  const leadingType = rawMediaQuery.match(/^(?:the\s+)?(radio|station|playlist|album|artist)s?\s*[:,]?\s+(.+)$/i);
+  const trailingType = rawMediaQuery.match(/^(.+?)\s+(radio|station|playlist|album|artist)s?$/i);
+  const targetType = voiceTargetType(slots.targetType) ?? voiceTargetType(leadingType?.[1]) ?? voiceTargetType(trailingType?.[2]);
+  const mediaQuery = leadingType?.[2] ?? trailingType?.[1] ?? rawMediaQuery;
+  const cleanedMediaQuery = mediaQuery
+    .replace(/^(the\s+)?(radio|station|playlist|album|artist)s?\s*[:,]?\s+/i, "")
+    .replace(/\s+(radio|station|playlist|album|artist)s?$/i, "")
+    .replace(/[.!?]+$/g, "")
+    .trim();
+  if (!cleanedMediaQuery) return undefined;
+  return { mediaQuery: voiceMediaAlias(cleanedMediaQuery), playerQuery: playerTarget, targetType };
+}
+
+function voiceViewTarget(view: string | null | undefined): { view: View; libraryKind?: LibraryKind } | undefined {
+  if (view === "nowPlaying") return { view: "now" };
+  if (view === "queue") return { view: "queue" };
+  if (view === "library") return { view: "library" };
+  if (view === "playlists") return { view: "library", libraryKind: "playlists" };
+  if (view === "artist") return { view: "library", libraryKind: "artists" };
+  if (view === "album") return { view: "library", libraryKind: "albums" };
+  if (view === "presets") return { view: "settings" };
+  return undefined;
 }
 
 function configDisplaySize(value: string | null | undefined): DisplaySize | undefined {
@@ -157,12 +325,19 @@ export default function App() {
   const [libraryKind, setLibraryKind] = useState<LibraryKind>("recent");
   const [library, setLibrary] = useState<MediaItem[]>([]);
   const [libraryBusy, setLibraryBusy] = useState(false);
+  const [libraryError, setLibraryError] = useState("");
+  const [aiRadioSwitch, setAiRadioSwitch] = useState<{ media: MediaItem | Preset; player: Player }>();
+  const aiRadioStarting = useRef(false);
   const [libraryHasMore, setLibraryHasMore] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [presets, setPresets] = useState<Preset[]>(loadPresets);
   const [presetCandidate, setPresetCandidate] = useState<MediaItem>();
   const [notice, setNotice] = useState("");
   const [volumePreview, setVolumePreview] = useState<number>();
+  const [phoneVolumePlayerId, setPhoneVolumePlayerId] = useState(loadPhoneVolumePlayerId);
+  const [phoneVolumePercent, setPhoneVolumePercent] = useState<number>();
+  const phoneVolumeControl = useRef<Awaited<ReturnType<typeof connectBridgeThingPhoneVolume>> | undefined>(undefined);
+  const phoneVolumeRoute = useRef(false);
   const [displaySize, setDisplaySize] = useState<DisplaySize>(loadDisplaySize);
   const [nowPlayingTextSize, setNowPlayingTextSize] = useState<NowPlayingTextSize>(loadNowPlayingTextSize);
   const [brightness, setBrightness] = useState<BrightnessPreference>(() => loadBrightnessPreference() ?? { mode: "auto", level: 0.55 });
@@ -173,14 +348,22 @@ export default function App() {
   const configReconnectTimer = useRef<number | undefined>(undefined);
   const volumePreviewRef = useRef<number | undefined>(undefined);
   const libraryRequestId = useRef(0);
+  const libraryCache = useRef(new LibraryCache());
   const reconnectFailures = useRef(0);
   const hadSuccessfulConnection = useRef(false);
   const connectInFlight = useRef<Promise<void> | undefined>(undefined);
+  const coreRefreshInFlight = useRef(false);
+  const lastSuccessfulContact = useRef(Date.now());
+  const lastBluetoothReconnect = useRef(0);
   const connectionStateRef = useRef<ConnectionState>("idle");
   const connectionStateChangedAt = useRef(Date.now());
   const configRef = useRef(config);
+  const handledVoiceStreams = useRef(new Map<string, number>());
+  const voiceActivityHandlerRef = useRef<(activity: VoiceActivity) => void>(() => undefined);
+  const voiceIntentHandlerRef = useRef<(intent: VoiceIntent) => void>(() => undefined);
 
-  const activePlayer = players.find((player) => player.player_id === activePlayerId) ?? players[0];
+  const activePlayer = currentPlayer(players, activePlayerId, phoneVolumePlayerId);
+  phoneVolumeRoute.current = !!phoneVolumePlayerId && activePlayer?.player_id === phoneVolumePlayerId;
   const activeQueue =
     queues.find((queue) => queue.queue_id === activePlayer?.player_id) ??
     queues.find((queue) => queue.queue_id === activePlayer?.active_source);
@@ -194,6 +377,10 @@ export default function App() {
   const showNotice = useCallback((message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice(""), 1_800);
+  }, []);
+
+  const markConnectionHealthy = useCallback(() => {
+    lastSuccessfulContact.current = Date.now();
   }, []);
 
   useEffect(() => {
@@ -239,23 +426,22 @@ export default function App() {
       client.command<Player[]>("players/all"),
       client.command<PlayerQueue[]>("player_queues/all"),
     ]);
+    markConnectionHealthy();
     const visiblePlayers = nextPlayers.filter((player) => player.available);
     setPlayers(visiblePlayers);
     setQueues(nextQueues);
     setActivePlayerId((current) => {
-      const selected = visiblePlayers.some((player) => player.player_id === current)
-        ? current
-        : visiblePlayers[0]?.player_id || "";
+      const selected = nextPlayerId(visiblePlayers, current, loadPhoneVolumePlayerId());
       if (selected) savePlayerId(selected);
       return selected;
     });
-  }, [client]);
+  }, [client, markConnectionHealthy]);
 
   const connect = useCallback(
     async (nextConfig = config, credentials?: { username: string; password: string }) => {
       if (connectInFlight.current) return connectInFlight.current;
       const run = (async () => {
-      if (!nextConfig.serverUrl) {
+      if (!connectionTarget(nextConfig)) {
         setView("settings");
         return;
       }
@@ -264,7 +450,7 @@ export default function App() {
       setError("");
       try {
         await client.connect(
-          nextConfig.serverUrl,
+          connectionTarget(nextConfig),
           credentials?.username ? undefined : nextConfig.token,
           nextConfig.transport ?? "direct",
         );
@@ -276,6 +462,7 @@ export default function App() {
           saveConfig(resolvedConfig);
         }
         await refreshCore();
+        markConnectionHealthy();
         setConnection("connected");
         hadSuccessfulConnection.current = true;
         reconnectFailures.current = 0;
@@ -306,7 +493,7 @@ export default function App() {
         if (connectInFlight.current === run) connectInFlight.current = undefined;
       }
     },
-    [client, config, refreshCore, sideBySide],
+    [client, config, markConnectionHealthy, refreshCore, sideBySide],
   );
 
   const scheduleReconnect = useCallback(
@@ -314,16 +501,27 @@ export default function App() {
       window.clearTimeout(reconnectTimer.current);
       reconnectTimer.current = window.setTimeout(() => {
         const nextConfig = configRef.current;
-        if (nextConfig.serverUrl) void connect(nextConfig);
+        if (connectionTarget(nextConfig)) void connect(nextConfig);
       }, delay);
     },
     [connect],
   );
 
+  const forceReconnect = useCallback(
+    (delay = 750) => {
+      const nextConfig = configRef.current;
+      if (!connectionTarget(nextConfig)) return;
+      client.disconnect();
+      setConnection((current) => (current === "idle" ? current : "error"));
+      scheduleReconnect(delay);
+    },
+    [client, scheduleReconnect],
+  );
+
   const ensureConnected = useCallback(async () => {
     if (connectionStateRef.current === "connected" && client.isConnected()) return true;
     const nextConfig = configRef.current;
-    if (!nextConfig.serverUrl) {
+    if (!connectionTarget(nextConfig)) {
       setView("settings");
       showNotice("Music Assistant is not configured");
       return false;
@@ -339,6 +537,11 @@ export default function App() {
     let removeDocSubscription: (() => void) | undefined;
     let cancelled = false;
     const handleUiChange = (key: string, value: string | null | undefined) => {
+      if (key === "phoneVolumePlayerId") {
+        setPhoneVolumePlayerId(value || "");
+        savePhoneVolumePlayerId(value || "");
+        return true;
+      }
       if (key === "displaySize") {
         const next = configDisplaySize(value);
         if (next) {
@@ -397,16 +600,17 @@ export default function App() {
       });
     void subscribeBridgeThingConfig((change) => {
       if (handleUiChange(change.key, change.value)) return;
-      if (change.key !== "serverUrl" && change.key !== "token" && change.key !== "transport") return;
+      if (change.key !== "serverUrl" && change.key !== "remoteId" && change.key !== "token" && change.key !== "transport") return;
       setConfig((current) => {
         const next: ConnectionConfig = {
           ...current,
           ...(change.key === "serverUrl" ? { serverUrl: change.value?.trim() || "" } : {}),
+          ...(change.key === "remoteId" ? { remoteId: change.value?.trim() || "" } : {}),
           ...(change.key === "token" ? { token: change.value?.trim() || undefined } : {}),
           ...(change.key === "transport"
             ? {
                 transport:
-                  change.value === "homeassistant" || change.value === "direct"
+                  change.value === "homeassistant" || change.value === "direct" || change.value === "webrtc"
                     ? change.value
                     : "bridgething",
               }
@@ -414,7 +618,7 @@ export default function App() {
         };
         saveConfig(next);
         window.clearTimeout(configReconnectTimer.current);
-        if (next.serverUrl) {
+        if (connectionTarget(next)) {
           configReconnectTimer.current = window.setTimeout(() => void connect(next), 750);
         }
         return next;
@@ -439,6 +643,7 @@ export default function App() {
 
   useEffect(() => {
     const removeEvent = client.onEvent((event: MassEvent) => {
+      markConnectionHealthy();
       if (event.event === "player_updated" && event.data) {
         const update = event.data as Player;
         setPlayers((current) => current.map((player) => (player.player_id === update.player_id ? update : player)));
@@ -485,6 +690,10 @@ export default function App() {
             setNowPlayingTextSize(bridgePreferences.nowPlayingTextSize);
             saveNowPlayingTextSize(bridgePreferences.nowPlayingTextSize);
           }
+          if (!cancelled && bridgePreferences?.phoneVolumePlayerId !== undefined) {
+            setPhoneVolumePlayerId(bridgePreferences.phoneVolumePlayerId);
+            savePhoneVolumePlayerId(bridgePreferences.phoneVolumePlayerId);
+          }
           if (!cancelled && bridgePreferences?.brightness) {
             setBrightness(bridgePreferences.brightness);
             saveBrightnessPreference(bridgePreferences.brightness);
@@ -496,7 +705,7 @@ export default function App() {
           // BridgeThing config is optional so local development and Nocturne installs keep working.
         }
       }
-      const configUrls = nextConfig.serverUrl
+      const configUrls = connectionTarget(nextConfig)
         ? []
         : sideBySide
         ? ["./device-config.json", "http://172.16.42.1:4173/api/device-config", "/api/device-config"]
@@ -516,7 +725,7 @@ export default function App() {
         }
       }
       if (cancelled) return;
-      if (nextConfig.serverUrl) void connect(nextConfig);
+      if (connectionTarget(nextConfig)) void connect(nextConfig);
       else setView("settings");
     };
     void bootstrap();
@@ -533,28 +742,30 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client]);
 
-  useEffect(() => {
-    if (connection === "error") {
-      const localRelay = isLocalRelayUrl(config.serverUrl);
-      const retryDelay = localRelay ? 4_000 : 8_000;
+	  useEffect(() => {
+	    if (connection === "error") {
+	      const localRelay = isLocalRelayUrl(config.serverUrl);
+	      const bridgeRuntime = isBridgeThingRuntime(sideBySide);
+	      const retryDelay = localRelay ? 4_000 : 8_000;
       reconnectTimer.current = window.setTimeout(() => {
         const nextConfig = configRef.current;
-        if (nextConfig.serverUrl) void connect(nextConfig);
+        if (connectionTarget(nextConfig)) void connect(nextConfig);
       }, localRelay ? 2_000 : 5_000);
       const interval = window.setInterval(() => {
         if (connectionStateRef.current !== "error") return;
         const nextConfig = configRef.current;
-        if (nextConfig.serverUrl) void connect(nextConfig);
+        if (connectionTarget(nextConfig)) void connect(nextConfig);
       }, retryDelay);
-      const reload = localRelay && sideBySide
-        ? window.setTimeout(() => {
-            const lastReload = Number(window.sessionStorage.getItem(AUTO_RELOAD_STORAGE_KEY) || "0");
-            if (Date.now() - lastReload > 45_000) {
-              window.sessionStorage.setItem(AUTO_RELOAD_STORAGE_KEY, String(Date.now()));
-              window.location.reload();
-            }
-          }, 18_000)
-        : undefined;
+	      const reload = (localRelay && sideBySide) || (bridgeRuntime && hadSuccessfulConnection.current)
+	        ? window.setTimeout(() => {
+	            const lastReload = Number(window.sessionStorage.getItem(AUTO_RELOAD_STORAGE_KEY) || "0");
+	            const reloadAfter = localRelay ? 45_000 : BRIDGETHING_RELOAD_AFTER_STALE_MS;
+	            if (Date.now() - lastReload > reloadAfter) {
+	              window.sessionStorage.setItem(AUTO_RELOAD_STORAGE_KEY, String(Date.now()));
+	              window.location.reload();
+	            }
+	          }, localRelay ? 18_000 : BRIDGETHING_RELOAD_AFTER_STALE_MS)
+	        : undefined;
       return () => {
         clearTimeout(reconnectTimer.current);
         window.clearInterval(interval);
@@ -567,28 +778,40 @@ export default function App() {
   useEffect(() => {
     if (connection !== "connected") return;
     const interval = window.setInterval(() => {
-      if (!client.isConnected()) {
-        setConnection("error");
-        scheduleReconnect();
+      const staleFor = Date.now() - lastSuccessfulContact.current;
+      if (coreRefreshInFlight.current) {
+        if (staleFor > STALE_CONNECTION_RECONNECT_MS) forceReconnect();
         return;
       }
-      void refreshCore().catch((reason) => {
-        setError(reason instanceof Error ? reason.message : String(reason));
-        setConnection("error");
-        scheduleReconnect();
-      });
+      if (!client.isConnected()) {
+        forceReconnect();
+        return;
+      }
+      coreRefreshInFlight.current = true;
+      void refreshCore()
+        .catch((reason) => {
+          setError(reason instanceof Error ? reason.message : String(reason));
+          forceReconnect();
+        })
+        .finally(() => {
+          coreRefreshInFlight.current = false;
+        });
     }, EXTERNAL_PLAYBACK_REFRESH_MS);
     return () => window.clearInterval(interval);
-  }, [client, connection, refreshCore, scheduleReconnect]);
+  }, [client, connection, forceReconnect, refreshCore]);
 
   useEffect(() => {
     const reconnectIfNeeded = () => {
       const nextConfig = configRef.current;
-      if (!nextConfig.serverUrl) return;
+      if (!connectionTarget(nextConfig)) return;
+      const staleFor = Date.now() - lastSuccessfulContact.current;
       if (connectionStateRef.current === "connected" && client.isConnected()) {
+        if (staleFor > STALE_CONNECTION_RECONNECT_MS) {
+          forceReconnect(250);
+          return;
+        }
         void refreshCore().catch(() => {
-          setConnection("error");
-          scheduleReconnect(750);
+          forceReconnect(750);
         });
         return;
       }
@@ -607,7 +830,39 @@ export default function App() {
       window.removeEventListener("pageshow", reconnectIfNeeded);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [client, refreshCore, scheduleReconnect]);
+  }, [client, forceReconnect, refreshCore, scheduleReconnect]);
+
+  useEffect(() => {
+    if (!isBridgeThingRuntime(sideBySide)) return;
+    let unsubscribeBluetooth: (() => void) | undefined;
+    let cancelled = false;
+    void subscribeBridgeThingBluetooth((connected) => {
+      const nextConfig = configRef.current;
+      if (!connectionTarget(nextConfig)) return;
+      if (connected) {
+        const now = Date.now();
+        const staleFor = now - lastSuccessfulContact.current;
+        if (connectionStateRef.current === "connected" && client.isConnected() && staleFor < STALE_CONNECTION_RECONNECT_MS) return;
+        if (now - lastBluetoothReconnect.current < 10_000) return;
+        lastBluetoothReconnect.current = now;
+        forceReconnect(1_000);
+        return;
+      }
+      client.disconnect();
+      setConnection((current) => (current === "idle" ? current : "error"));
+    })
+      .then((unsubscribe) => {
+        if (cancelled) unsubscribe();
+        else unsubscribeBluetooth = unsubscribe;
+      })
+      .catch(() => {
+        // Older BridgeThing versions may not emit Bluetooth status events.
+      });
+    return () => {
+      cancelled = true;
+      unsubscribeBluetooth?.();
+    };
+  }, [client, forceReconnect, sideBySide]);
 
   useEffect(() => {
     if (!sideBySide || !isLocalRelayUrl(config.serverUrl)) return;
@@ -619,55 +874,73 @@ export default function App() {
     return () => window.clearInterval(watchdog);
   }, [config.serverUrl, sideBySide]);
 
+  const libraryScope = JSON.stringify([config.transport, connectionTarget(config), config.token]);
+  useEffect(() => {
+    libraryCache.current.setScope(libraryScope);
+    libraryRequestId.current += 1;
+    setLibrary([]);
+    setLibraryHasMore(false);
+    setLibraryError("");
+    setLibraryBusy(false);
+  }, [libraryScope]);
+
   const loadLibrary = useCallback(
-    async (kind: LibraryKind, query = "", append = false) => {
-      if (connection !== "connected" || !client.isConnected()) {
-        const connected = await ensureConnected();
-        if (!connected) return;
-      }
+    async (kind: LibraryKind, query = "", append = false, force = false) => {
       const requestId = ++libraryRequestId.current;
       const trimmedQuery = query.trim();
-      setLibraryBusy(true);
+      const key = libraryKey(kind, trimmedQuery);
+      libraryCache.current.setScope(libraryScope);
+      const cached = libraryCache.current.read(key);
       setLibraryKind(kind);
+      setLibraryError("");
       if (!append) {
-        setLibrary([]);
-        setLibraryHasMore(false);
+        setLibrary(cached?.items || []);
+        setLibraryHasMore(cached?.hasMore || false);
       }
+      const maxAge = kind === "recent" ? 15_000 : 60_000;
+      if (!append && !force && cached && Date.now() - cached.updatedAt < maxAge) {
+        setLibraryBusy(false);
+        return;
+      }
+      setLibraryBusy(true);
       try {
-        let result: unknown;
-        const offset = append ? library.length : 0;
-        if (trimmedQuery) {
-          const search = await client.command<Record<string, MediaItem[]>>("music/search", {
-            search_query: trimmedQuery,
-            limit: 50,
-          });
-          result = Object.values(search).flat();
-        } else if (kind === "recent") {
-          result = await client.command<MediaItem[]>("music/recently_played_items", { limit: 16 });
-        } else {
-          result = await client.command<MediaItem[]>(libraryCommands[kind], {
-            limit: LIBRARY_PAGE_SIZE,
-            offset,
-            favorite: null,
-          });
+        if (connection !== "connected" || !client.isConnected()) {
+          if (!(await ensureConnected())) return;
         }
-        if (libraryRequestId.current !== requestId) return;
-        const page = Array.isArray(result) ? (result as MediaItem[]) : [];
-        setLibrary((current) => (append ? [...current, ...page] : page));
-        setLibraryHasMore(!trimmedQuery && kind !== "recent" && page.length === LIBRARY_PAGE_SIZE);
+        if (requestId !== libraryRequestId.current) return;
+        const page = await libraryCache.current.load(key, offset => fetchLibraryPage(client, kind, trimmedQuery, offset), append);
+        if (requestId !== libraryRequestId.current) return;
+        setLibrary(page.items);
+        setLibraryHasMore(page.hasMore);
       } catch (reason) {
-        if (libraryRequestId.current !== requestId) return;
-        showNotice(reason instanceof Error ? reason.message : "Library request failed");
+        if (requestId !== libraryRequestId.current) return;
+        const message = reason instanceof Error ? reason.message : "Library request failed";
+        setLibraryError(message);
+        showNotice(message);
       } finally {
-        if (libraryRequestId.current === requestId) setLibraryBusy(false);
+        if (requestId === libraryRequestId.current) setLibraryBusy(false);
       }
     },
-    [client, connection, ensureConnected, library.length, showNotice],
+    [client, connection, ensureConnected, libraryScope, showNotice],
   );
 
   useEffect(() => {
-    if (view === "library" && library.length === 0) void loadLibrary(libraryKind);
-  }, [view, library.length, libraryKind, loadLibrary]);
+    if (view === "library" && connection === "connected") void loadLibrary(libraryKind, searchQuery);
+    // Load on entry or reconnect; an empty/error result must not trigger repeated requests.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, connection]);
+
+  useEffect(() => {
+    if (connection !== "connected") return;
+    const timers = (["recent", "playlists"] as LibraryKind[]).map((kind, index) => window.setTimeout(() => {
+      if (!client.isConnected()) return;
+      const key = libraryKey(kind);
+      const cached = libraryCache.current.read(key);
+      if (cached && Date.now() - cached.updatedAt < 60_000) return;
+      void libraryCache.current.load(key, offset => fetchLibraryPage(client, kind, "", offset)).catch(() => {});
+    }, 800 + index * 1200));
+    return () => timers.forEach(timer => window.clearTimeout(timer));
+  }, [client, connection, libraryScope]);
 
   const refreshQueueItems = useCallback(
     async (queueId = activeQueue?.queue_id) => {
@@ -821,30 +1094,333 @@ export default function App() {
     [activeQueue, queueCommand, refreshQueueAfterCommand, showNotice],
   );
 
-  const playMedia = useCallback(
-    async (media: MediaItem | Preset) => {
-      if (!activePlayer) return showNotice("Select a player first");
+  const playMediaOnPlayer = useCallback(
+    async (media: MediaItem | Preset | MediaItem[], targetPlayer: Player, options: PlayMediaOptions = {}) => {
+      let startingAiRadio = false;
       try {
         if (!(await ensureConnected())) return;
-        await client.command("player_queues/play_media", {
-          queue_id: activeQueue?.queue_id || activePlayer.player_id,
-          media: media.uri,
-          media_type: "media_type" in media ? media.media_type : media.mediaType,
+        const primaryMedia = Array.isArray(media) ? media[0] : media;
+        if (!primaryMedia) return showNotice("No playable items found");
+        const targetQueue =
+          queues.find((queue) => queue.queue_id === targetPlayer.player_id) ??
+          queues.find((queue) => queue.queue_id === targetPlayer.active_source);
+        const queueId = targetQueue?.queue_id || targetPlayer.player_id;
+        const mediaType = "media_type" in primaryMedia ? primaryMedia.media_type : primaryMedia.mediaType;
+        if (mediaType === "ai_radio") {
+          if (aiRadioStarting.current) return;
+          aiRadioStarting.current = true;
+          startingAiRadio = true;
+          const status = await client.command<{ sessions: Array<{ session_id: string; status: string }> }>("ai_radio/status");
+          const running = status.sessions.filter((session) => session.status === "running");
+          if (running.length && !options.replaceAiRadio) {
+            setAiRadioSwitch({ media: primaryMedia, player: targetPlayer });
+            return;
+          }
+          for (const session of running) await client.command("ai_radio/stop", { session_id: session.session_id });
+          showNotice(`Starting ${primaryMedia.name}...`);
+          await client.command("ai_radio/start", {
+            station_id: decodeURIComponent(primaryMedia.uri.split("/show/")[1] || ""),
+            player_id_override: targetPlayer.player_id,
+          });
+        } else await client.command("player_queues/play_media", {
+          queue_id: queueId,
+          media: Array.isArray(media) ? media.map((item) => item.uri) : media.uri,
+          media_type: "media_type" in primaryMedia ? primaryMedia.media_type : primaryMedia.mediaType,
           option: "replace",
+          radio_mode: options.radioMode,
         });
+        if (options.shuffle) {
+          await client.command("player_queues/shuffle", {
+            queue_id: queueId,
+            shuffle_enabled: true,
+          });
+        }
+        setActivePlayerId(targetPlayer.player_id);
+        savePlayerId(targetPlayer.player_id);
         setView("now");
         window.setTimeout(() => void refreshCore(), 350);
         window.setTimeout(() => void refreshCore(), 1_200);
       } catch (reason) {
         showNotice(reason instanceof Error ? reason.message : "Unable to play item");
+      } finally {
+        if (startingAiRadio) aiRadioStarting.current = false;
       }
     },
-    [activePlayer, activeQueue?.queue_id, client, ensureConnected, refreshCore, showNotice],
+    [client, ensureConnected, queues, refreshCore, showNotice],
   );
+
+  const playMedia = useCallback(
+    async (media: MediaItem | Preset) => {
+      if (!activePlayer) return showNotice(activePlayerId === phoneVolumePlayerId && phoneVolumePlayerId ? "Waiting for phone audio" : "Select a player first");
+      await playMediaOnPlayer(media, activePlayer);
+    },
+    [activePlayer, activePlayerId, phoneVolumePlayerId, playMediaOnPlayer, showNotice],
+  );
+
+  const findVoiceMedia = useCallback(
+    async (query: string, targetType?: string) => {
+      const libraryMatches: Array<{ item: MediaItem; score: number }> = [];
+      for (const kind of voiceLibraryKinds(targetType)) {
+        const libraryItems = await client.command<MediaItem[]>(libraryCommands[kind], {
+          limit: 20,
+          offset: 0,
+          favorite: null,
+          search: query,
+        });
+        const libraryMatch = rankBestMedia(libraryItems, query);
+        if (libraryMatch && (kind !== "radio" || scoreMatch(query, libraryMatch.item.name) >= 70)) {
+          libraryMatches.push(libraryMatch);
+        }
+      }
+      libraryMatches.sort((a, b) => b.score - a.score);
+      if (libraryMatches[0]) return libraryMatches[0].item;
+
+      const search = await client.command<Record<string, MediaItem[]>>("music/search", {
+        search_query: query,
+        limit: 20,
+      });
+      const searchItems = Object.values(search).flat();
+      const preferredTypes =
+        targetType === "station"
+          ? ["radio"]
+          : targetType === "playlist"
+          ? ["playlist"]
+          : targetType === "album"
+          ? ["album"]
+          : targetType === "artist"
+          ? ["artist"]
+          : [];
+      const preferredSearchItems = preferredTypes.length
+        ? searchItems.filter((item) => preferredTypes.includes(item.media_type))
+        : searchItems;
+      const searchMatch = findBestMedia(preferredSearchItems, query) ?? findBestMedia(searchItems, query);
+      if (searchMatch && (searchMatch.media_type !== "radio" || scoreMatch(query, searchMatch.name) >= 70)) {
+        return searchMatch;
+      }
+      return findBestMedia(searchItems, query);
+    },
+    [client],
+  );
+
+  const findVoiceArtistTracks = useCallback(
+    async (query: string, artist: MediaItem) => {
+      const artistName = artist.name || query;
+      const libraryTracks = await client.command<MediaItem[]>("music/tracks/library_items", {
+        limit: VOICE_ARTIST_TRACK_LIMIT,
+        offset: 0,
+        favorite: null,
+        search: artistName,
+        order_by: "random",
+      });
+      const matchingLibraryTracks = libraryTracks.filter((track) => artistMatches(track, artistName));
+      const playableLibraryTracks = matchingLibraryTracks.length
+        ? matchingLibraryTracks
+        : libraryTracks.filter((track) => track.media_type === "track");
+      if (playableLibraryTracks.length) return playableLibraryTracks.slice(0, VOICE_ARTIST_TRACK_LIMIT);
+
+      const search = await client.command<Record<string, MediaItem[]>>("music/search", {
+        search_query: artistName,
+        limit: VOICE_ARTIST_TRACK_LIMIT,
+      });
+      const searchTracks = (search.tracks ?? []).filter((track) => track.media_type === "track");
+      const matchingSearchTracks = searchTracks.filter((track) => artistMatches(track, artistName));
+      return matchingSearchTracks.slice(0, VOICE_ARTIST_TRACK_LIMIT);
+    },
+    [client],
+  );
+
+  const resolveVoicePlayer = useCallback(
+    (playerQuery?: string) => {
+      if (playerQuery) return findBestPlayer(players, playerQuery);
+      return activePlayer;
+    },
+    [activePlayer, players],
+  );
+
+  const handleVoicePlay = useCallback(
+    async (input: VoiceIntent | VoiceActivity) => {
+      const command = parseVoicePlayCommand(input);
+      saveVoiceDebug({
+        stage: "play-parse",
+        transcript: input.transcript,
+        intent: input.intent,
+        command,
+      });
+      if (!command) return false;
+      const targetPlayer = resolveVoicePlayer(command.playerQuery);
+      if (!targetPlayer) {
+        saveVoiceDebug({
+          stage: "play-no-player",
+          transcript: input.transcript,
+          command,
+          playerQuery: command.playerQuery,
+        });
+        showNotice(command.playerQuery ? `No player matched ${command.playerQuery}` : "Select a player first");
+        return true;
+      }
+      try {
+        if (!(await ensureConnected())) return true;
+        const media = await findVoiceMedia(command.mediaQuery, command.targetType);
+        if (!media) {
+          saveVoiceDebug({
+            stage: "play-no-media",
+            transcript: input.transcript,
+            command,
+            player: targetPlayer.display_name || targetPlayer.name,
+          });
+          showNotice(`No match for ${command.mediaQuery}`);
+          return true;
+        }
+        const artistTracks = media.media_type === "artist" ? await findVoiceArtistTracks(command.mediaQuery, media) : [];
+        const playTarget = artistTracks.length ? artistTracks : media;
+        const shuffle = media.media_type === "artist";
+        const radioMode = media.media_type === "artist" && artistTracks.length === 0;
+        saveVoiceDebug({
+          stage: "play-match",
+          transcript: input.transcript,
+          command,
+          media: { name: media.name, media_type: media.media_type, uri: media.uri },
+          tracks: artistTracks.map((track) => ({ name: track.name, artists: track.artists?.map((artist) => artist.name) })),
+          player: targetPlayer.display_name || targetPlayer.name,
+          shuffle,
+          radioMode,
+        });
+        showNotice(`Playing ${media.name}${shuffle ? " shuffled" : ""} on ${targetPlayer.display_name || targetPlayer.name}`);
+        await playMediaOnPlayer(playTarget, targetPlayer, { shuffle, radioMode });
+        return true;
+      } catch (reason) {
+        saveVoiceDebug({
+          stage: "play-error",
+          transcript: input.transcript,
+          command,
+          error: reason instanceof Error ? reason.message : String(reason),
+        });
+        showNotice(reason instanceof Error ? reason.message : "Voice command failed");
+        return true;
+      }
+    },
+    [ensureConnected, findVoiceArtistTracks, findVoiceMedia, playMediaOnPlayer, resolveVoicePlayer, showNotice],
+  );
+
+  const handleVoiceIntent = useCallback(
+    (intent: VoiceIntent) => {
+      saveVoiceDebug({ stage: "intent", transcript: intent.transcript, intent: intent.intent, slots: intent.slots });
+      if (intent.intent === "showView") {
+        const target = voiceViewTarget(intent.slots.view);
+        if (!target) return;
+        if (target.libraryKind) {
+          setView("library");
+          void loadLibrary(target.libraryKind);
+        } else {
+          setView(target.view);
+        }
+        return;
+      }
+      if (intent.intent === "search") {
+        const query = intent.slots.target || intent.transcript.replace(/\b(search|find|show)\b/gi, "").trim();
+        if (!query) return;
+        setSearchQuery(query);
+        setView("library");
+        void loadLibrary(libraryKind, query);
+        return;
+      }
+      void handleVoicePlay(intent);
+    },
+    [handleVoicePlay, libraryKind, loadLibrary],
+  );
+
+  const handleVoiceActivity = useCallback(
+    (activity: VoiceActivity) => {
+      if (activity.phase !== "done" && activity.phase !== "failed") return;
+      const transcript = activity.transcript?.trim();
+      saveVoiceDebug({
+        stage: "activity",
+        phase: activity.phase,
+        transcript,
+        intent: activity.intent,
+        nluStage: activity.stage,
+        target: activity.target,
+        error: activity.error,
+        slots: activity.slots,
+      });
+      if (transcript) showNotice(`Voice: ${transcript}`);
+      if (activity.error && !transcript) return;
+      const now = Date.now();
+      handledVoiceStreams.current.forEach((handledAt, streamId) => {
+        if (now - handledAt > VOICE_COMMAND_FRESH_MS) handledVoiceStreams.current.delete(streamId);
+      });
+      if (activity.streamId) {
+        if (handledVoiceStreams.current.has(activity.streamId)) return;
+        handledVoiceStreams.current.set(activity.streamId, now);
+      }
+      void handleVoicePlay(activity);
+    },
+    [handleVoicePlay, showNotice],
+  );
+
+  useEffect(() => {
+    voiceActivityHandlerRef.current = handleVoiceActivity;
+    voiceIntentHandlerRef.current = handleVoiceIntent;
+  }, [handleVoiceActivity, handleVoiceIntent]);
+
+  useEffect(() => {
+    if (!isBridgeThingRuntime(sideBySide)) return;
+    let unsubscribeVoice: (() => void) | undefined;
+    let cancelled = false;
+    void subscribeBridgeThingVoice({
+      activity: (activity) => voiceActivityHandlerRef.current(activity),
+      intent: (intent) => voiceIntentHandlerRef.current(intent),
+    })
+      .then((unsubscribe) => {
+        if (cancelled) unsubscribe();
+        else unsubscribeVoice = unsubscribe;
+      })
+      .catch(() => {
+        // Voice is only available on newer BridgeThing firmware.
+      });
+    return () => {
+      cancelled = true;
+      unsubscribeVoice?.();
+    };
+  }, [sideBySide]);
+
+  useEffect(() => {
+    if (!isBridgeThingRuntime(sideBySide)) return;
+    let cancelled = false;
+    let control: Awaited<ReturnType<typeof connectBridgeThingPhoneVolume>> | undefined;
+    void connectBridgeThingPhoneVolume(percent => {
+      setPhoneVolumePercent(percent);
+      if (phoneVolumeRoute.current && volumePreviewRef.current !== undefined) {
+        volumePreviewRef.current = percent;
+        setVolumePreview(percent);
+      }
+    }, () => { if (phoneVolumeRoute.current) showNotice("Phone media volume is unavailable"); }).then(next => {
+      control = next;
+      if (cancelled) next.close();
+      else phoneVolumeControl.current = next;
+    }).catch(() => showNotice("Phone volume connection unavailable"));
+    return () => { cancelled = true; control?.close(); phoneVolumeControl.current = undefined; };
+  }, [sideBySide, showNotice]);
+
+  useEffect(() => {
+    window.clearTimeout(volumeCommandTimer.current);
+    window.clearTimeout(volumeOverlayTimer.current);
+    volumePreviewRef.current = undefined;
+    setVolumePreview(undefined);
+  }, [activePlayer?.player_id, phoneVolumePlayerId]);
 
   const changeVolume = useCallback(
     (change: number) => {
       if (!activePlayer) return;
+      if (phoneVolumeRoute.current) {
+        if (!phoneVolumeControl.current) return showNotice("Phone volume connection unavailable");
+        volumePreviewRef.current = phoneVolumePercent ?? 0;
+        setVolumePreview(phoneVolumePercent ?? 0);
+        void phoneVolumeControl.current.adjust(change).catch(() => showNotice("Unable to change phone volume"));
+        window.clearTimeout(volumeOverlayTimer.current);
+        volumeOverlayTimer.current = window.setTimeout(() => { volumePreviewRef.current = undefined; setVolumePreview(undefined); }, VOLUME_OVERLAY_HIDE_MS);
+        return;
+      }
       const baseline = volumePreviewRef.current ?? activePlayer.volume_level ?? 0;
       const next = Math.max(0, Math.min(100, baseline + change));
       volumePreviewRef.current = next;
@@ -862,7 +1438,7 @@ export default function App() {
         setVolumePreview(undefined);
       }, VOLUME_OVERLAY_HIDE_MS);
     },
-    [activePlayer, playerCommand],
+    [activePlayer, playerCommand, phoneVolumePercent, showNotice],
   );
 
   const savePreset = useCallback(
@@ -895,9 +1471,15 @@ export default function App() {
     [playMedia, presets, showNotice],
   );
 
+  const scrollPlayers = (delta: number) => {
+    const dialog = document.querySelector(".players-page [role=dialog]");
+    const area = dialog ? dialog.querySelector(".group-members-list") : document.querySelector(".players-page");
+    area?.scrollBy({ top: delta, behavior: "auto" });
+  };
+
   useHardware({
-    dialLeft: () => (view === "queue" ? selectQueueDelta(-1) : changeVolume(-2)),
-    dialRight: () => (view === "queue" ? selectQueueDelta(1) : changeVolume(2)),
+    dialLeft: () => (view === "players" ? scrollPlayers(-72) : view === "queue" ? selectQueueDelta(-1) : changeVolume(-2)),
+    dialRight: () => (view === "players" ? scrollPlayers(72) : view === "queue" ? selectQueueDelta(1) : changeVolume(2)),
     dialPress: () => (view === "queue" ? playSelectedQueueItem() : void playerCommand("play_pause")),
     presetPress: pressPreset,
     presetLongPress: savePreset,
@@ -936,15 +1518,17 @@ export default function App() {
     });
   };
 
+  const artworkBase = config.transport === "webrtc" ? REMOTE_ARTWORK_BASE : config.serverUrl;
+  const ambientArtwork = useArtworkUrl(imageUrl(artworkBase, itemImage(currentItem), 256, artworkCacheKey(currentItem)));
   return (
     <main className="device-shell" data-display-size={displaySize} data-now-playing-text-size={nowPlayingTextSize}>
-      <div className="ambient" style={{ backgroundImage: currentItem ? `url(${imageUrl(config.serverUrl, itemImage(currentItem), 256, artworkCacheKey(currentItem))})` : undefined }} />
+      <div className="ambient" style={{ backgroundImage: ambientArtwork ? `url(${ambientArtwork})` : undefined }} />
 
       <section className="content">
         {view === "now" && (
           <NowPlaying
             item={currentItem}
-            serverUrl={config.serverUrl}
+            serverUrl={artworkBase}
             playing={isPlaying}
             queue={activeQueue}
             onPrevious={() => void playerCommand("previous")}
@@ -961,9 +1545,11 @@ export default function App() {
             kind={libraryKind}
             items={library}
             busy={libraryBusy}
+            error={libraryError}
             query={searchQuery}
-            serverUrl={config.serverUrl}
-            onKind={(kind) => void loadLibrary(kind)}
+            serverUrl={artworkBase}
+            onKind={(kind) => { setSearchQuery(""); void loadLibrary(kind); }}
+            onRefresh={() => void loadLibrary(libraryKind, searchQuery, false, true)}
             onQuery={setSearchQuery}
             onSearch={submitSearch}
             onSelect={(item) => setPresetCandidate(item)}
@@ -973,7 +1559,11 @@ export default function App() {
             onLoadMore={() => void loadLibrary(libraryKind, searchQuery, true)}
           />
         )}
-        {view === "players" && <PlayersView players={players} selected={activePlayer?.player_id} onSelect={selectPlayer} />}
+        {view === "players" && <PlayersView client={client} fallbackPlayers={players} selected={activePlayer?.player_id} onSelect={selectPlayer} onChanged={refreshCore} phoneVolumePlayerId={phoneVolumePlayerId} phoneVolumePercent={phoneVolumePercent} onPhoneVolumePlayer={isBridgeThingRuntime(sideBySide) ? id => {
+          setPhoneVolumePlayerId(id);
+          savePhoneVolumePlayerId(id);
+          void setBridgeThingPhoneVolumePlayer(id).catch(() => showNotice("Phone volume saved on this device only"));
+        } : undefined} />}
         {view === "queue" && (
           <QueueView
             items={queueItems}
@@ -981,7 +1571,7 @@ export default function App() {
             currentIndex={activeQueue?.current_index ?? 0}
             lockedIndex={activeQueue?.index_in_buffer ?? activeQueue?.current_index ?? -1}
             selectedIndex={selectedQueueIndex}
-            serverUrl={config.serverUrl}
+            serverUrl={artworkBase}
             onSelect={(index) => {
               setQueueSelectionTouched(true);
               setSelectedQueueIndex(index);
@@ -1029,6 +1619,22 @@ export default function App() {
         {sideBySide && <NavButton active={false} label="Nocturne" icon={<ArrowLeft />} onClick={returnToNocturne} />}
       </nav>
 
+      {aiRadioSwitch && (
+        <div className="ai-radio-backdrop">
+          <div className="ai-radio-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-radio-switch-title">
+            <h2 id="ai-radio-switch-title">Switch AI Radio show?</h2>
+            <p>An AI Radio show is already on air. Stop it and play {aiRadioSwitch.media.name} on {aiRadioSwitch.player.display_name || aiRadioSwitch.player.name}?</p>
+            <div className="ai-radio-actions">
+              <button onClick={() => setAiRadioSwitch(undefined)}>Cancel</button>
+              <button className="primary" onClick={() => {
+                const pending = aiRadioSwitch;
+                setAiRadioSwitch(undefined);
+                void playMediaOnPlayer(pending.media, pending.player, { replaceAiRadio: true });
+              }}>Switch show</button>
+            </div>
+          </div>
+        </div>
+      )}
       {notice && <div className="notice">{notice}</div>}
       {volumePreview !== undefined && <VolumeOverlay volume={volumePreview} />}
     </main>
@@ -1075,7 +1681,7 @@ function NowPlaying({ item, serverUrl, playing, queue, shuffleEnabled, repeatMod
 
   // The Car Thing runs Chromium 69. Keep this at the same image-proxy size as
   // the library thumbnails, which is known to decode reliably on the device.
-  const image = imageUrl(serverUrl, itemImage(item), 256, artworkCacheKey(item));
+  const image = useArtworkUrl(imageUrl(serverUrl, itemImage(item), 256, artworkCacheKey(item)));
   const media = item?.media_item;
   const title = media?.name || item?.name || "Nothing playing";
   const artist = media ? itemSubtitle(media) : "Select something from your library";
@@ -1149,50 +1755,41 @@ function ScrollingTitle({ title }: { title: string }) {
   );
 }
 
-function LibraryView({ kind, items, busy, query, serverUrl, selected, hasMore, onKind, onQuery, onSearch, onSelect, onPlay, onLoadMore }: {
-  kind: LibraryKind; items: MediaItem[]; busy: boolean; query: string; serverUrl: string; selected?: string; hasMore: boolean;
+function LibraryView({ kind, items, busy, error, query, serverUrl, selected, hasMore, onKind, onRefresh, onQuery, onSearch, onSelect, onPlay, onLoadMore }: {
+  kind: LibraryKind; items: MediaItem[]; busy: boolean; error: string; query: string; serverUrl: string; selected?: string; hasMore: boolean;
   onKind: (kind: LibraryKind) => void; onQuery: (query: string) => void; onSearch: (event: FormEvent) => void;
   onSelect: (item: MediaItem) => void; onPlay: (item: MediaItem) => void; onLoadMore: () => void;
+  onRefresh: () => void;
 }) {
   return (
     <div className="page library-page">
       <div className="page-heading">
         <div><h2>Your library</h2><p>Long-press 1–4 to save the selected item</p></div>
+        <button onClick={onRefresh} disabled={busy} title="Refresh library" aria-label="Refresh library"><RefreshCw size={18} className={busy ? "spin" : ""} /></button>
         <form className="search-box" onSubmit={onSearch}><Search size={17} /><input value={query} onChange={(e) => onQuery(e.target.value)} placeholder="Search" /></form>
       </div>
       <div className="filter-row">
-        {(["recent", "playlists", "albums", "artists", "radio"] as LibraryKind[]).map((value) => (
-          <button className={kind === value ? "active" : ""} key={value} onClick={() => onKind(value)}>{value}</button>
+        {(["recent", "playlists", "albums", "artists", "radio", "ai_radio"] as LibraryKind[]).map((value) => (
+          <button className={kind === value ? "active" : ""} key={value} onClick={() => onKind(value)}>{value === "ai_radio" ? "AI Radio" : value}</button>
         ))}
       </div>
-      {busy ? <div className="center-state"><LoaderCircle className="spin" /> Loading library…</div> : (
+      {busy && !items.length ? <div className="center-state"><LoaderCircle className="spin" /> Loading library…</div> : (
         <div className="media-grid">
           {items.map((item) => {
             const image = imageUrl(serverUrl, itemImage(item), 256);
             return (
               <article className={selected === item.uri ? "media-card selected" : "media-card"} key={item.uri} onClick={() => onSelect(item)} onDoubleClick={() => onPlay(item)}>
-                <div className="media-image">{image ? <img src={image} alt="" /> : <Album />}</div>
+                <div className="media-image"><Artwork url={image} fallback={item.media_type === "ai_radio" ? <Radio /> : <Album />} /></div>
                 <div className="media-copy"><strong>{item.name}</strong><span>{itemSubtitle(item)}</span></div>
                 <button onClick={(event) => { event.stopPropagation(); onPlay(item); }} aria-label={`Play ${item.name}`}><Play fill="currentColor" /></button>
               </article>
             );
           })}
-          {!items.length && <div className="center-state">No library items found</div>}
+          {!items.length && <div className="center-state">{error || (kind === "ai_radio" ? "No AI Radio shows found" : "No library items found")}</div>}
+          {!!error && <button onClick={onRefresh} aria-label="Retry library"><RefreshCw size={18} /></button>}
           {hasMore && <button className="load-more" onClick={onLoadMore} disabled={busy}>{busy ? "Loading…" : `Load more (${items.length} shown)`}</button>}
         </div>
       )}
-    </div>
-  );
-}
-
-function PlayersView({ players, selected, onSelect }: { players: Player[]; selected?: string; onSelect: (player: Player) => void }) {
-  return (
-    <div className="page"><div className="page-heading"><div><h2>Choose a player</h2><p>All available Music Assistant outputs</p></div></div>
-      <div className="player-grid">{players.map((player) => (
-        <button key={player.player_id} className={selected === player.player_id ? "player-card selected" : "player-card"} onClick={() => onSelect(player)}>
-          <span className="speaker-icon"><Speaker /></span><span><strong>{player.display_name || player.name}</strong><small>{player.state || (player.powered ? "idle" : "off")}</small></span><span className="player-volume"><Volume2 size={16} /> {player.volume_level}</span>
-        </button>
-      ))}</div>
     </div>
   );
 }
@@ -1232,7 +1829,7 @@ function QueueView({ items, current, currentIndex, lockedIndex, selectedIndex, s
             ref={isSelected ? selectedRef : undefined}
           >
             <span className="queue-index">{isCurrent ? <Volume2 size={16} /> : index + 1}</span>
-            <span className="queue-art">{image ? <img src={image} alt="" /> : <Music2 />}</span>
+            <span className="queue-art"><Artwork url={image} fallback={<Music2 />} /></span>
             <span className="queue-copy"><strong>{item.name}</strong><small>{item.media_item ? itemSubtitle(item.media_item) : ""}</small></span>
             <time>{formatTime(item.duration)}</time>
             <span className="queue-actions">
@@ -1257,6 +1854,7 @@ function SettingsView({ config, state, error, presets, displaySize, nowPlayingTe
   onBrightness: (preference: BrightnessPreference) => void;
 }) {
   const [serverUrl, setServerUrl] = useState(config.serverUrl);
+  const [remoteId, setRemoteId] = useState(config.remoteId || "");
   const [transport, setTransport] = useState<ConnectionConfig["transport"]>(config.transport ?? "direct");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -1264,14 +1862,14 @@ function SettingsView({ config, state, error, presets, displaySize, nowPlayingTe
   const showLoginFields = transport !== "homeassistant";
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const validationError = validateConnectionUrl(serverUrl, transport);
+    const validationError = validateConnection({ serverUrl, remoteId, transport });
     if (validationError) {
       setFormError(validationError);
       return;
     }
     setFormError("");
     onConnect(
-      { serverUrl: serverUrl.trim(), token: serverUrl.trim() === config.serverUrl ? config.token : undefined, transport },
+      { serverUrl: serverUrl.trim(), remoteId: normalizeRemoteId(remoteId), token: transport === config.transport && (transport === "webrtc" ? normalizeRemoteId(remoteId) === normalizeRemoteId(config.remoteId || "") : serverUrl.trim() === config.serverUrl) ? config.token : undefined, transport },
       showLoginFields && username ? { username, password } : undefined,
     );
   };
@@ -1283,9 +1881,10 @@ function SettingsView({ config, state, error, presets, displaySize, nowPlayingTe
       </div>
       <div className="settings-columns">
         <form className="connection-form" onSubmit={submit}>
-          <label>{urlLabel(transport)}<input value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} placeholder={urlPlaceholder(transport)} /></label>
+          {transport === "webrtc" ? <label>Music Assistant Remote ID<input value={remoteId} onChange={e => setRemoteId(e.target.value)} autoCapitalize="characters" autoComplete="off" spellCheck={false} /></label> : <label>{urlLabel(transport)}<input value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} placeholder={urlPlaceholder(transport)} /></label>}
           <label>Connection path<select value={transport ?? "direct"} onChange={(e) => setTransport(e.target.value as ConnectionConfig["transport"])}>
             <option value="homeassistant">Home Assistant / Nabu Casa</option>
+            <option value="webrtc">Music Assistant WebRTC</option>
             <option value="direct">Direct browser connection</option>
             <option value="bridgething">BridgeThing companion network</option>
           </select></label>
@@ -1326,18 +1925,7 @@ function SettingsView({ config, state, error, presets, displaySize, nowPlayingTe
   );
 }
 
-function validateConnectionUrl(serverUrl: string, transport: ConnectionConfig["transport"]): string | undefined {
-  let parsed: URL;
-  try {
-    parsed = new URL(serverUrl.trim());
-  } catch {
-    return "Enter a Music Assistant URL, not a Remote ID";
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return "Music Assistant URL must start with http:// or https://";
-  }
-  if ((transport === "bridgething" || transport === "homeassistant") && parsed.protocol !== "https:") {
-    return "BridgeThing Android requires an https:// URL";
-  }
-  return undefined;
+function Artwork({ url, fallback }: { url: string; fallback: React.ReactNode }) {
+  const image = useArtworkUrl(url);
+  return image ? <img src={image} alt="" /> : fallback;
 }
