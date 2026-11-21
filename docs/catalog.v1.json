@@ -1,6 +1,6 @@
 {
   "schema": "catalog.v1",
-  "updated_at": "2026-11-21T23:53:40.484Z",
+  "updated_at": "2026-11-21T23:56:47Z",
   "repo": {
     "name": "Music Assistant BridgeThing",
     "description": "BridgeThing apps for Music Assistant.",
@@ -20,7 +20,7 @@
         "music"
       ],
       "screenshots": [
-        "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/screenshots/now-playing-v0.1.6.png"
+        "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/screenshots/ally-venable-now-playing-v0.1.6.png"
       ],
       "versions": [
         {
