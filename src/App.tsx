@@ -43,7 +43,7 @@ import {
 } from "./lib/bridgething";
 import { imageUrl, itemImage } from "./lib/images";
 import { MassClient } from "./lib/MassClient";
-import { connectionTarget, normalizeRemoteId, validateConnection } from "./lib/connection";
+import { connectionTarget, connectionTimings, normalizeRemoteId, validateConnection } from "./lib/connection";
 import { REMOTE_ARTWORK_BASE, useArtworkUrl } from "./lib/remoteArtwork";
 import { fetchLibraryPage, LibraryCache, libraryKey, type LibraryKind } from "./lib/library";
 import { currentPlayer, nextPlayerId } from "./lib/phonePlayer";
@@ -87,8 +87,6 @@ type PlayMediaOptions = {
 const VOLUME_COMMAND_DELAY_MS = 500;
 const VOLUME_OVERLAY_HIDE_MS = 3_000;
 const PLAYING_POSITION_FRESH_MS = 15_000;
-const EXTERNAL_PLAYBACK_REFRESH_MS = 4_000;
-const STALE_CONNECTION_RECONNECT_MS = 18_000;
 const BRIDGETHING_RELOAD_AFTER_STALE_MS = 75_000;
 const SIDE_BY_SIDE_PATH = "/music-assistant";
 const AUTO_RELOAD_STORAGE_KEY = "carthing-ma-last-auto-reload";
@@ -313,6 +311,7 @@ export default function App() {
   const sideBySide = isSideBySideInstall();
   const client = useMemo(() => new MassClient(), []);
   const [config, setConfig] = useState<ConnectionConfig>(loadConfig);
+  const { refreshMs, staleMs } = connectionTimings(config.transport);
   const [connection, setConnection] = useState<ConnectionState>("idle");
   const [error, setError] = useState("");
   const [view, setView] = useState<View>("now");
@@ -780,7 +779,7 @@ export default function App() {
     const interval = window.setInterval(() => {
       const staleFor = Date.now() - lastSuccessfulContact.current;
       if (coreRefreshInFlight.current) {
-        if (staleFor > STALE_CONNECTION_RECONNECT_MS) forceReconnect();
+        if (staleFor > staleMs) forceReconnect();
         return;
       }
       if (!client.isConnected()) {
@@ -796,9 +795,9 @@ export default function App() {
         .finally(() => {
           coreRefreshInFlight.current = false;
         });
-    }, EXTERNAL_PLAYBACK_REFRESH_MS);
+    }, refreshMs);
     return () => window.clearInterval(interval);
-  }, [client, connection, forceReconnect, refreshCore]);
+  }, [client, connection, forceReconnect, refreshCore, refreshMs, staleMs]);
 
   useEffect(() => {
     const reconnectIfNeeded = () => {
@@ -806,7 +805,7 @@ export default function App() {
       if (!connectionTarget(nextConfig)) return;
       const staleFor = Date.now() - lastSuccessfulContact.current;
       if (connectionStateRef.current === "connected" && client.isConnected()) {
-        if (staleFor > STALE_CONNECTION_RECONNECT_MS) {
+        if (staleFor > staleMs) {
           forceReconnect(250);
           return;
         }
@@ -830,7 +829,7 @@ export default function App() {
       window.removeEventListener("pageshow", reconnectIfNeeded);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [client, forceReconnect, refreshCore, scheduleReconnect]);
+  }, [client, forceReconnect, refreshCore, scheduleReconnect, staleMs]);
 
   useEffect(() => {
     if (!isBridgeThingRuntime(sideBySide)) return;
@@ -842,7 +841,7 @@ export default function App() {
       if (connected) {
         const now = Date.now();
         const staleFor = now - lastSuccessfulContact.current;
-        if (connectionStateRef.current === "connected" && client.isConnected() && staleFor < STALE_CONNECTION_RECONNECT_MS) return;
+        if (connectionStateRef.current === "connected" && client.isConnected() && staleFor < staleMs) return;
         if (now - lastBluetoothReconnect.current < 10_000) return;
         lastBluetoothReconnect.current = now;
         forceReconnect(1_000);
@@ -862,7 +861,7 @@ export default function App() {
       cancelled = true;
       unsubscribeBluetooth?.();
     };
-  }, [client, forceReconnect, sideBySide]);
+  }, [client, forceReconnect, sideBySide, staleMs]);
 
   useEffect(() => {
     if (!sideBySide || !isLocalRelayUrl(config.serverUrl)) return;

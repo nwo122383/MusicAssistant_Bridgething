@@ -1,12 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { base32nopad } from "@scure/base";
-import { connectionTarget, normalizeRemoteId, tcpRelayServers, validRemoteId, validateConnection } from "./connection";
+import { connectionTarget, connectionTimings, normalizeRemoteId, tcpRelayServers, validRemoteId, validateConnection } from "./connection";
 import { verifyAndSanitizeSdp } from "./ma-remote/crypto-utils";
 
 const remoteId = base32nopad.encode(new Uint8Array(16).fill(17)).replace(/2/g, "9");
 const fingerprint = Array(32).fill("11").join(":");
 
 describe("WebRTC connection configuration", () => {
+  it("allows slow Bluetooth snapshots without changing local connection timing", () => {
+    const remote = connectionTimings("webrtc");
+    expect(remote.refreshMs).toBe(15_000);
+    expect(remote.commandMs).toBe(30_000);
+    expect(remote.staleMs).toBeGreaterThan(remote.commandMs);
+    for (const transport of [undefined, "direct", "bridgething", "homeassistant"] as const) {
+      expect(connectionTimings(transport)).toEqual({ commandMs: 15_000, refreshMs: 4_000, staleMs: 18_000 });
+    }
+  });
   it("accepts formatted Remote IDs without requiring a server URL", () => {
     const formatted = `${remoteId.slice(0, 8)}-${remoteId.slice(8)}`.toLowerCase();
     expect(normalizeRemoteId(formatted)).toBe(remoteId);

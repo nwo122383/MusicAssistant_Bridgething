@@ -10,7 +10,7 @@
 
 A Music Assistant controller for Spotify Car Thing running BridgeThing.
 
-**Latest release: 0.1.5.** [What's changed and upgrade notes](docs/releases/v0.1.5.md).
+**Latest release: 0.1.6.** [What's changed and upgrade notes](docs/releases/v0.1.6.md).
 
 ## Requirements
 
@@ -35,7 +35,7 @@ https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs
 ```
 
 For manual webapp installation, use
-[the 0.1.5 ZIP](docs/music-assistant-bridgething-v0.1.5.zip). This is an app bundle,
+[the 0.1.6 ZIP](docs/music-assistant-bridgething-v0.1.6.zip). This is an app bundle,
 **not** a Car Thing firmware image. The app ID stays the same across releases so
 BridgeThing can update an existing installation in place.
 
@@ -192,11 +192,11 @@ The release command builds the app and phone settings page, packages the ZIP,
 copies the ZIP and matching hosted settings page into `docs/`, and updates
 the catalog's sizes, SHA-256 checksums, URLs, and release timestamp.
 
-For 0.1.5, the installable archive is written to:
+For 0.1.6, the installable archive is written to:
 
 ```text
-release/music-assistant-bridgething-v0.1.5.zip
-docs/music-assistant-bridgething-v0.1.5.zip
+release/music-assistant-bridgething-v0.1.6.zip
+docs/music-assistant-bridgething-v0.1.6.zip
 ```
 
 Commit and push the source, release notes, generated files in `docs/`, and

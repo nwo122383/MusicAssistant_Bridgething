@@ -14,10 +14,24 @@ vi.mock("./WebRtcSocket", () => ({ createWebRtcSocket: (_id: string, message: (d
 
 let client: MassClient;
 beforeEach(() => { rtc.sockets.length = 0; client = new MassClient(); });
-afterEach(() => client.disconnect());
+afterEach(() => { client.disconnect(); vi.useRealTimers(); });
 const greeting = JSON.stringify({ server_id: "test-server", server_version: "2.10.13" });
 
 describe("Music Assistant over WebRTC", () => {
+  it("allows slow remote responses but still rejects an unresponsive command", async () => {
+    vi.useFakeTimers();
+    const connecting = client.connect("remote-id", undefined, "webrtc");
+    rtc.sockets[0].message(greeting);
+    await connecting;
+    const command = client.command("players/all");
+    const request = JSON.parse(rtc.sockets[0].send.mock.calls[0][0]);
+    await vi.advanceTimersByTimeAsync(20_000);
+    rtc.sockets[0].message(JSON.stringify({ message_id: request.message_id, result: [] }));
+    expect(await command).toEqual([]);
+    const timedOut = expect(client.command("player_queues/all")).rejects.toThrow(/timed out/);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await timedOut;
+  });
   it("authenticates over the data channel before becoming ready", async () => {
     const connecting = client.connect("remote-id", "test-token", "webrtc");
     const socket = rtc.sockets[0];

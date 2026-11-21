@@ -1,6 +1,6 @@
 {
   "schema": "catalog.v1",
-  "updated_at": "2026-11-21T23:29:16.280Z",
+  "updated_at": "2026-11-21T23:53:40.484Z",
   "repo": {
     "name": "Music Assistant BridgeThing",
     "description": "BridgeThing apps for Music Assistant.",
@@ -16,7 +16,33 @@
       "icon": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/icon.svg",
       "homepage": "https://github.com/nwo122383/MusicAssistant_Bridgething",
       "source": "https://github.com/nwo122383/MusicAssistant_Bridgething",
+      "categories": [
+        "music"
+      ],
+      "screenshots": [
+        "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/screenshots/now-playing-v0.1.6.png"
+      ],
       "versions": [
+        {
+          "version": "0.1.6",
+          "permissions": [
+            "net.ws",
+            "net.proxy"
+          ],
+          "min_libbridgething_version": "0.17.1",
+          "changelog": "Keep downloaded album artwork visible through same-account reconnects, protect displayed covers from cache eviction, and retry temporary artwork failures. Reduce full player/queue polling over WebRTC and allow slower Bluetooth-backed responses to finish before reconnecting. Add an actual Car Thing Now Playing screenshot to the store listing.",
+          "download": {
+            "url": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/music-assistant-bridgething-v0.1.6.zip",
+            "size": 218582,
+            "sha256": "036c7567d54f58a0edc07e80bdabba424cb353aa44c04e08d51f8855424eb91a"
+          },
+          "settings": {
+            "url": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/music-assistant-bridgething-v0.1.6-settings.html",
+            "size": 359625,
+            "sha256": "fc60a7b53f70f68bde63b0917b2976d0b481f7414c95fbe5d032e85bd049b788"
+          },
+          "released_at": "2026-11-21T23:53:40.484Z"
+        },
         {
           "version": "0.1.5",
           "released_at": "2026-11-21T23:29:16.280Z",

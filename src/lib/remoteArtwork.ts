@@ -4,9 +4,12 @@ export const REMOTE_ARTWORK_BASE = "https://ma.webrtc.invalid";
 type Loader = (path: string) => Promise<Blob>;
 let loader: Loader | undefined;
 let revision = 0;
+let scope = "";
+let scopeRevision = 0;
 const listeners = new Set<() => void>();
-const cache = new Map<string, Promise<string>>();
-const objectUrls = new Set<string>();
+type Entry = { url: string; promise?: Promise<string> };
+const cache = new Map<string, Entry>();
+const users = new Map<string, number>();
 const jobs: Array<() => void> = [];
 let inFlight = 0;
 
@@ -27,43 +30,63 @@ function scheduleLoad(path: string, currentRevision: number, currentLoader: Load
   });
 }
 
+export function setRemoteArtworkScope(next: string): void {
+  if (scope === next) return;
+  scope = next;
+  scopeRevision += 1;
+  loader = undefined;
+  cache.forEach(entry => { if (entry.url) URL.revokeObjectURL(entry.url); });
+  cache.clear();
+  revision += 1;
+  listeners.forEach(listener => listener());
+}
+
 export function setRemoteArtworkLoader(next: Loader | undefined): void {
   loader = next;
   revision += 1;
-  cache.clear();
-  objectUrls.forEach(url => URL.revokeObjectURL(url));
-  objectUrls.clear();
+  // A transport is replaceable; downloaded images belong to the server/account.
+  cache.forEach((entry, path) => { if (!entry.url) cache.delete(path); });
   listeners.forEach(listener => listener());
+}
+
+function trimCache(): void {
+  for (const [path, entry] of cache) {
+    if (cache.size <= 80) break;
+    if (users.has(path)) continue;
+    cache.delete(path);
+    if (entry.url) URL.revokeObjectURL(entry.url);
+  }
 }
 
 function loadRemoteImage(path: string): Promise<string> {
   const cached = cache.get(path);
-  if (cached) return cached;
+  if (cached) {
+    cache.delete(path);
+    cache.set(path, cached);
+    return cached.promise ?? Promise.resolve(cached.url);
+  }
   if (!loader) return Promise.resolve("");
   const currentRevision = revision;
-  const promise = scheduleLoad(path, currentRevision, loader).then(blob => {
-    if (currentRevision !== revision) return "";
+  const entry: Entry = { url: "" };
+  cache.set(path, entry);
+  entry.promise = scheduleLoad(path, currentRevision, loader).then(blob => {
+    if (currentRevision !== revision || cache.get(path) !== entry) return "";
     const url = URL.createObjectURL(blob);
-    objectUrls.add(url);
+    entry.url = url;
+    entry.promise = undefined;
     return url;
   }).catch(() => {
-    if (currentRevision === revision) cache.delete(path);
+    if (cache.get(path) === entry) cache.delete(path);
     return "";
   });
-  cache.set(path, promise);
-  // Limit artwork retained while browsing a large library on the Car Thing.
-  if (cache.size > 80) {
-    const oldest = cache.keys().next().value!;
-    const entry = cache.get(oldest)!;
-    cache.delete(oldest);
-    void entry.then(url => { if (url) { URL.revokeObjectURL(url); objectUrls.delete(url); } });
-  }
-  return promise;
+  trimCache();
+  return entry.promise;
 }
 
 export function useArtworkUrl(url: string): string {
   const [epoch, setEpoch] = useState(revision);
-  const [resolved, setResolved] = useState({ source: "", url: "", epoch: -1 });
+  const currentScope = scopeRevision;
+  const [resolved, setResolved] = useState({ source: "", url: "", scope: -1 });
   const remote = url.startsWith(`${REMOTE_ARTWORK_BASE}/`);
   useEffect(() => {
     const changed = () => setEpoch(revision);
@@ -74,10 +97,25 @@ export function useArtworkUrl(url: string): string {
   useEffect(() => {
     if (!remote) return;
     let active = true;
-    void loadRemoteImage(url.slice(REMOTE_ARTWORK_BASE.length)).then(result => {
-      if (active) setResolved({ source: url, url: result, epoch });
-    });
-    return () => { active = false; };
-  }, [url, remote, epoch]);
-  return remote ? resolved.source === url && resolved.epoch === epoch ? resolved.url : "" : url;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0;
+    const path = url.slice(REMOTE_ARTWORK_BASE.length);
+    users.set(path, (users.get(path) ?? 0) + 1);
+    const load = async () => {
+      const result = await loadRemoteImage(path);
+      if (!active) return;
+      if (result) setResolved({ source: url, url: result, scope: currentScope });
+      else if (loader && attempts < 3) timer = setTimeout(() => { void load(); }, 2000 * 2 ** attempts++);
+    };
+    void load();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+      const remaining = (users.get(path) ?? 1) - 1;
+      if (remaining) users.set(path, remaining);
+      else users.delete(path);
+      trimCache();
+    };
+  }, [url, remote, epoch, currentScope]);
+  return remote ? resolved.source === url && resolved.scope === currentScope ? resolved.url : "" : url;
 }

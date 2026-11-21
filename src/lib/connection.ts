@@ -1,6 +1,13 @@
 import { base32nopad } from "@scure/base";
 import type { ConnectionConfig } from "../types";
 
+export function connectionTimings(transport?: ConnectionConfig["transport"]) {
+  // Full player/queue snapshots can take seconds over Bluetooth-backed TURN.
+  return transport === "webrtc"
+    ? { commandMs: 30_000, refreshMs: 15_000, staleMs: 45_000 }
+    : { commandMs: 15_000, refreshMs: 4_000, staleMs: 18_000 };
+}
+
 export function normalizeRemoteId(value: string): string {
   return value.toUpperCase().replace(/[\s-]/g, "");
 }

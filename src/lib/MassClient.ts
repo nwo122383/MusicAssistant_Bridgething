@@ -1,7 +1,8 @@
 import type { GroupPlayer, MassEvent, MassImage, MediaItem, Player, PlayerQueue, QueueItem } from "../types";
 import { membershipChanges, ungroupTargets } from "./playerGroups";
 import { createWebRtcSocket } from "./WebRtcSocket";
-import { setRemoteArtworkLoader } from "./remoteArtwork";
+import { setRemoteArtworkLoader, setRemoteArtworkScope } from "./remoteArtwork";
+import { connectionTimings } from "./connection";
 
 type MassTransport = "direct" | "bridgething" | "homeassistant" | "webrtc";
 
@@ -31,6 +32,7 @@ export class MassClient {
   private eventListeners = new Set<(event: MassEvent) => void>();
   private closeListeners = new Set<() => void>();
   private sequence = 0;
+  private commandTimeoutMs = 15_000;
   private haSequence = 0;
   private serverReady?: () => void;
   private connectionEpoch = 0;
@@ -49,6 +51,8 @@ export class MassClient {
     this.disconnect();
     const epoch = this.connectionEpoch;
     const base = serverUrl.replace(/\/$/, "");
+    this.commandTimeoutMs = connectionTimings(transport).commandMs;
+    setRemoteArtworkScope(JSON.stringify([transport, base, token ?? ""]));
     if (transport === "homeassistant") {
       await this.connectHomeAssistant(base, token);
       return;
@@ -174,7 +178,7 @@ export class MassClient {
       const timeout = window.setTimeout(() => {
         this.pending.delete(messageId);
         reject(new Error(`Music Assistant command timed out: ${command}`));
-      }, 15_000);
+      }, this.commandTimeoutMs);
       this.pending.set(messageId, {
         resolve: resolve as (value: unknown) => void,
         reject,
