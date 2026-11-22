@@ -91,4 +91,30 @@ describe("AI Radio through Home Assistant ingress", () => {
     const requestBody = JSON.parse(new TextDecoder().decode(mocks.fetch.mock.calls[0][0].request.body));
     expect(requestBody).toMatchObject({ command: "players/all", args: { return_unavailable: true, return_disabled: true } });
   });
+
+  it("adjusts each group member by the same number through ingress", async () => {
+    const baseRequest = internal.haRequest.getMockImplementation() as (type: string, args?: Record<string, unknown>) => Promise<unknown>;
+    internal.haRequest.mockImplementation(async (type, args) => type === "config/entity_registry/list"
+      ? [{ entity_id: "media_player.move", unique_id: "move", platform: "music_assistant" }]
+      : baseRequest(type, args));
+    mocks.fetch.mockImplementation(async ({ request }) => {
+      const body = JSON.parse(new TextDecoder().decode(request.body));
+      const response = body.command === "players/get"
+        ? body.args.player_id === "move"
+          ? { player_id: "move", name: "Move", available: true, powered: true, volume_level: 10, group_members: ["dining"], group_volume: 35 }
+          : { player_id: "dining", name: "Dining", available: true, powered: true, volume_level: 35, synced_to: "move" }
+        : null;
+      return { ok: true, response: { response: { status: 200, body: new TextEncoder().encode(JSON.stringify(response)) } } };
+    });
+    const target = await client.getVolumeTarget({ player_id: "media_player.move", name: "Move", available: true, powered: true, volume_level: 10, group_members: ["media_player.dining"] });
+    expect(target.level).toBe(35);
+    await client.setVolume(target, 37);
+    const commands = mocks.fetch.mock.calls.map(([{ request }]) => JSON.parse(new TextDecoder().decode(request.body)));
+    expect(commands.filter(command => command.command === "players/cmd/volume_set")).toMatchObject([
+      { command: "players/cmd/volume_set", args: { player_id: "dining", volume_level: 37 } },
+      { command: "players/cmd/volume_set", args: { player_id: "move", volume_level: 12 } },
+    ]);
+    expect(internal.haRequest.mock.calls.some(([type]) => type === "call_service")).toBe(false);
+    expect(mocks.close).toHaveBeenCalledTimes(6);
+  });
 });

@@ -63,6 +63,9 @@ button { border: 0; background: none; cursor: pointer; }
 .connection.connected { color: var(--green); background: rgba(101,230,167,.1); }
 .connection.error { color: #ff9a9a; }
 .content { min-height: 0; overflow: hidden; }
+.player-fullscreen-toggle { position: absolute; top: 8px; right: 10px; z-index: 2; width: 36px; height: 36px; display: grid; place-items: center; border-radius: 6px; color: #aeb3bd; opacity: .5; }
+.player-fullscreen-toggle:hover, .player-fullscreen-toggle:focus-visible { opacity: 1; background: rgba(255,255,255,.08); }
+.player-fullscreen-toggle:focus-visible { outline: 2px solid var(--green); }
 .page { height: 100%; overflow: auto; padding: 18px 24px 28px; scrollbar-width: thin; }
 .page-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 13px; }
 .page-heading h2 { margin: 0 0 2px; font-size: 22px; }
@@ -169,6 +172,16 @@ button { border: 0; background: none; cursor: pointer; }
 .group-choice input { width: 24px; height: 24px; flex-shrink: 0; accent-color: var(--green); }
 .group-choice small { display: block; color: var(--muted); font-size: 13px; margin-top: 4px; }
 .group-editor .ai-radio-actions { flex-shrink: 0; }
+.volume-panel-meter { display: grid; grid-template-columns: minmax(0, 1fr) 64px; align-items: center; gap: 12px; min-height: 44px; margin-top: 10px; color: var(--green); border-bottom: 2px solid rgba(101,230,167,.35); }
+.volume-panel-meter > span { overflow-wrap: anywhere; }
+.volume-panel-meter > strong { text-align: right; font-size: 22px; }
+.volume-members-list .group-choice > svg { flex-shrink: 0; }
+.volume-members-list { margin-top: 8px; }
+.volume-members-list .group-choice { min-height: 44px; padding: 8px 6px; gap: 10px; }
+.volume-members-list .volume-member-level { flex: 0 0 54px; text-align: right; color: var(--muted); }
+.volume-editor-actions { margin-top: 12px; }
+.volume-editor-actions > button { display: flex; align-items: center; justify-content: center; gap: 8px; }
+.volume-editor .center-state { flex: 1; }
 
 .queue-position { align-self: center; padding: 6px 10px; border-radius: 14px; color: #aeb3bd; background: rgba(255,255,255,.06); font-size: 11px; font-weight: 700; }
 .queue-list { display: grid; gap: 5px; }
@@ -356,4 +369,34 @@ button { border: 0; background: none; cursor: pointer; }
   .device-shell[data-display-size="standard"] .transport .mode { width: 36px; height: 36px; }
   .device-shell[data-display-size="standard"] .transport svg { width: 19px; }
   .device-shell[data-display-size="standard"] .page { padding-top: 12px; }
+}
+
+.device-shell.player-fullscreen {
+  grid-template-rows: minmax(0, 1fr);
+  --track-name-size: 44px;
+  --track-artist-size: 24px;
+  --transport-btn-size: 70px;
+  --transport-play-btn-size: 96px;
+  --transport-icon-size: 36px;
+}
+.device-shell.player-fullscreen .now-playing { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; padding: 16px; }
+.device-shell.player-fullscreen .artwork { width: 100%; height: auto; aspect-ratio: 1; max-width: calc(100vh - 32px); max-height: calc(100vh - 32px); border-radius: 8px; }
+.device-shell.player-fullscreen .track-panel { height: 100%; max-height: 420px; display: flex; flex-direction: column; justify-content: flex-end; }
+.device-shell.player-fullscreen .track-copy { margin: 42px 0 auto; padding-bottom: 24px; }
+.device-shell.player-fullscreen .track-copy p { margin-top: 12px; }
+.device-shell.player-fullscreen .track-copy .track-album { margin-top: 6px; font-size: 20px; }
+.device-shell.player-fullscreen .progress { height: 6px; flex-shrink: 0; }
+.device-shell.player-fullscreen .times { padding-top: 9px; font-size: 13px; }
+.device-shell.player-fullscreen .transport { gap: 6px; justify-content: space-between; margin-top: 24px; }
+.device-shell.player-fullscreen .transport button { flex-shrink: 0; width: 70px; height: 70px; }
+.device-shell.player-fullscreen .transport .mode { width: 54px; height: 54px; }
+.device-shell.player-fullscreen .transport .play { width: 96px; height: 96px; }
+.device-shell.player-fullscreen .transport button svg { width: 36px; height: 36px; }
+.device-shell.player-fullscreen .transport .play svg { width: 44px; height: 44px; }
+@media (max-width: 740px) {
+  .device-shell.player-fullscreen .transport button { width: 48px; height: 48px; }
+  .device-shell.player-fullscreen .transport .mode { width: 40px; height: 40px; }
+  .device-shell.player-fullscreen .transport .play { width: 72px; height: 72px; }
+  .device-shell.player-fullscreen .transport button svg { width: 28px; height: 28px; }
+  .device-shell.player-fullscreen .transport .play svg { width: 36px; height: 36px; }
 }

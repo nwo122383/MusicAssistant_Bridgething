@@ -9,6 +9,8 @@ import {
   Home,
   ListMusic,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
   Music2,
   Pause,
   Play,
@@ -28,6 +30,7 @@ import {
   Volume2,
 } from "lucide-react";
 import { useHardware } from "./hooks/useHardware";
+import { usePlayerVolume } from "./hooks/usePlayerVolume";
 import { PlayersView } from "./components/PlayersView";
 import {
   applyBridgeThingBrightness,
@@ -47,6 +50,7 @@ import { connectionTarget, connectionTimings, normalizeRemoteId, validateConnect
 import { REMOTE_ARTWORK_BASE, useArtworkUrl } from "./lib/remoteArtwork";
 import { fetchLibraryPage, LibraryCache, libraryKey, type LibraryKind } from "./lib/library";
 import { currentPlayer, nextPlayerId } from "./lib/phonePlayer";
+import type { VolumeControl } from "./lib/playerVolume";
 import {
   loadBrightnessPreference,
   loadConfig,
@@ -84,7 +88,6 @@ type PlayMediaOptions = {
   radioMode?: boolean;
   replaceAiRadio?: boolean;
 };
-const VOLUME_COMMAND_DELAY_MS = 500;
 const VOLUME_OVERLAY_HIDE_MS = 3_000;
 const PLAYING_POSITION_FRESH_MS = 15_000;
 const BRIDGETHING_RELOAD_AFTER_STALE_MS = 75_000;
@@ -315,6 +318,9 @@ export default function App() {
   const [connection, setConnection] = useState<ConnectionState>("idle");
   const [error, setError] = useState("");
   const [view, setView] = useState<View>("now");
+  const [playerFullscreen, setPlayerFullscreen] = useState(false);
+  const fullPlayer = playerFullscreen && view === "now";
+  useEffect(() => { if (view !== "now") setPlayerFullscreen(false); }, [view]);
   const [players, setPlayers] = useState<Player[]>([]);
   const [queues, setQueues] = useState<PlayerQueue[]>([]);
   const [activePlayerId, setActivePlayerId] = useState(loadPlayerId);
@@ -333,6 +339,7 @@ export default function App() {
   const [presetCandidate, setPresetCandidate] = useState<MediaItem>();
   const [notice, setNotice] = useState("");
   const [volumePreview, setVolumePreview] = useState<number>();
+  const [volumeControl, setVolumeControl] = useState<VolumeControl>();
   const [phoneVolumePlayerId, setPhoneVolumePlayerId] = useState(loadPhoneVolumePlayerId);
   const [phoneVolumePercent, setPhoneVolumePercent] = useState<number>();
   const phoneVolumeControl = useRef<Awaited<ReturnType<typeof connectBridgeThingPhoneVolume>> | undefined>(undefined);
@@ -342,7 +349,6 @@ export default function App() {
   const [brightness, setBrightness] = useState<BrightnessPreference>(() => loadBrightnessPreference() ?? { mode: "auto", level: 0.55 });
   const [brightnessAvailable, setBrightnessAvailable] = useState(false);
   const reconnectTimer = useRef<number | undefined>(undefined);
-  const volumeCommandTimer = useRef<number | undefined>(undefined);
   const volumeOverlayTimer = useRef<number | undefined>(undefined);
   const configReconnectTimer = useRef<number | undefined>(undefined);
   const volumePreviewRef = useRef<number | undefined>(undefined);
@@ -362,7 +368,7 @@ export default function App() {
   const voiceIntentHandlerRef = useRef<(intent: VoiceIntent) => void>(() => undefined);
 
   const activePlayer = currentPlayer(players, activePlayerId, phoneVolumePlayerId);
-  phoneVolumeRoute.current = !!phoneVolumePlayerId && activePlayer?.player_id === phoneVolumePlayerId;
+  phoneVolumeRoute.current = !volumeControl && !!phoneVolumePlayerId && activePlayer?.player_id === phoneVolumePlayerId;
   const activeQueue =
     queues.find((queue) => queue.queue_id === activePlayer?.player_id) ??
     queues.find((queue) => queue.queue_id === activePlayer?.active_source);
@@ -734,7 +740,6 @@ export default function App() {
       removeClose();
       clearTimeout(reconnectTimer.current);
       client.disconnect();
-      clearTimeout(volumeCommandTimer.current);
       clearTimeout(volumeOverlayTimer.current);
     };
     // Initial connection is intentionally performed once.
@@ -778,6 +783,10 @@ export default function App() {
     if (connection !== "connected") return;
     const interval = window.setInterval(() => {
       const staleFor = Date.now() - lastSuccessfulContact.current;
+      if (volumeControl) {
+        if (!client.isConnected() || staleFor > staleMs) forceReconnect();
+        return;
+      }
       if (coreRefreshInFlight.current) {
         if (staleFor > staleMs) forceReconnect();
         return;
@@ -797,7 +806,7 @@ export default function App() {
         });
     }, refreshMs);
     return () => window.clearInterval(interval);
-  }, [client, connection, forceReconnect, refreshCore, refreshMs, staleMs]);
+  }, [client, connection, forceReconnect, refreshCore, refreshMs, staleMs, volumeControl]);
 
   useEffect(() => {
     const reconnectIfNeeded = () => {
@@ -1402,15 +1411,26 @@ export default function App() {
   }, [sideBySide, showNotice]);
 
   useEffect(() => {
-    window.clearTimeout(volumeCommandTimer.current);
     window.clearTimeout(volumeOverlayTimer.current);
     volumePreviewRef.current = undefined;
     setVolumePreview(undefined);
-  }, [activePlayer?.player_id, phoneVolumePlayerId]);
+  }, [activePlayer?.player_id, phoneVolumePlayerId, volumeControl]);
+
+  const playerVolume = usePlayerVolume({
+    client,
+    player: volumeControl?.player ?? activePlayer,
+    players,
+    enabled: !phoneVolumeRoute.current,
+    individual: volumeControl?.individual,
+    nativeId: !!volumeControl,
+    connectionKey: JSON.stringify([config.transport, connectionTarget(config), config.token, client.volumeRevision]),
+    ensureConnected,
+    onError: showNotice,
+  });
 
   const changeVolume = useCallback(
     (change: number) => {
-      if (!activePlayer) return;
+      if (!activePlayer && !volumeControl) return;
       if (phoneVolumeRoute.current) {
         if (!phoneVolumeControl.current) return showNotice("Phone volume connection unavailable");
         volumePreviewRef.current = phoneVolumePercent ?? 0;
@@ -1420,24 +1440,9 @@ export default function App() {
         volumeOverlayTimer.current = window.setTimeout(() => { volumePreviewRef.current = undefined; setVolumePreview(undefined); }, VOLUME_OVERLAY_HIDE_MS);
         return;
       }
-      const baseline = volumePreviewRef.current ?? activePlayer.volume_level ?? 0;
-      const next = Math.max(0, Math.min(100, baseline + change));
-      volumePreviewRef.current = next;
-      setVolumePreview(next);
-      setPlayers((current) =>
-        current.map((player) => (player.player_id === activePlayer.player_id ? { ...player, volume_level: next } : player)),
-      );
-      clearTimeout(volumeCommandTimer.current);
-      volumeCommandTimer.current = window.setTimeout(() => {
-        void playerCommand("volume_set", { volume_level: next });
-      }, VOLUME_COMMAND_DELAY_MS);
-      clearTimeout(volumeOverlayTimer.current);
-      volumeOverlayTimer.current = window.setTimeout(() => {
-        volumePreviewRef.current = undefined;
-        setVolumePreview(undefined);
-      }, VOLUME_OVERLAY_HIDE_MS);
+      playerVolume.changeVolume(change);
     },
-    [activePlayer, playerCommand, phoneVolumePercent, showNotice],
+    [activePlayer, volumeControl, playerVolume.changeVolume, phoneVolumePercent, showNotice],
   );
 
   const savePreset = useCallback(
@@ -1477,13 +1482,14 @@ export default function App() {
   };
 
   useHardware({
-    dialLeft: () => (view === "players" ? scrollPlayers(-72) : view === "queue" ? selectQueueDelta(-1) : changeVolume(-2)),
-    dialRight: () => (view === "players" ? scrollPlayers(72) : view === "queue" ? selectQueueDelta(1) : changeVolume(2)),
+    dialLeft: () => (view === "players" && !volumeControl ? scrollPlayers(-72) : view === "queue" ? selectQueueDelta(-1) : changeVolume(-2)),
+    dialRight: () => (view === "players" && !volumeControl ? scrollPlayers(72) : view === "queue" ? selectQueueDelta(1) : changeVolume(2)),
     dialPress: () => (view === "queue" ? playSelectedQueueItem() : void playerCommand("play_pause")),
     presetPress: pressPreset,
     presetLongPress: savePreset,
     back: () => {
-      if (sideBySide && view === "now") returnToNocturne();
+      if (fullPlayer) setPlayerFullscreen(false);
+      else if (sideBySide && view === "now") returnToNocturne();
       else setView("now");
     },
     settings: () => setView("settings"),
@@ -1520,10 +1526,11 @@ export default function App() {
   const artworkBase = config.transport === "webrtc" ? REMOTE_ARTWORK_BASE : config.serverUrl;
   const ambientArtwork = useArtworkUrl(imageUrl(artworkBase, itemImage(currentItem), 256, artworkCacheKey(currentItem)));
   return (
-    <main className="device-shell" data-display-size={displaySize} data-now-playing-text-size={nowPlayingTextSize}>
+    <main className={`device-shell${fullPlayer ? " player-fullscreen" : ""}`} data-display-size={displaySize} data-now-playing-text-size={nowPlayingTextSize}>
       <div className="ambient" style={{ backgroundImage: ambientArtwork ? `url(${ambientArtwork})` : undefined }} />
 
       <section className="content">
+        {view === "now" && <button className="player-fullscreen-toggle" aria-label={fullPlayer ? "Show navigation" : "Expand player"} title={fullPlayer ? "Show navigation" : "Expand player"} aria-pressed={fullPlayer} onClick={() => setPlayerFullscreen(current => !current)}>{fullPlayer ? <Minimize2 size={19} /> : <Maximize2 size={19} />}</button>}
         {view === "now" && (
           <NowPlaying
             item={currentItem}
@@ -1558,7 +1565,7 @@ export default function App() {
             onLoadMore={() => void loadLibrary(libraryKind, searchQuery, true)}
           />
         )}
-        {view === "players" && <PlayersView client={client} fallbackPlayers={players} selected={activePlayer?.player_id} onSelect={selectPlayer} onChanged={refreshCore} phoneVolumePlayerId={phoneVolumePlayerId} phoneVolumePercent={phoneVolumePercent} onPhoneVolumePlayer={isBridgeThingRuntime(sideBySide) ? id => {
+        {view === "players" && <PlayersView client={client} fallbackPlayers={players} selected={activePlayer?.player_id} onSelect={selectPlayer} onChanged={refreshCore} onVolumeControl={setVolumeControl} onVolumeData={markConnectionHealthy} volumeLevel={playerVolume.volume} phoneVolumePlayerId={phoneVolumePlayerId} phoneVolumePercent={phoneVolumePercent} onPhoneVolumePlayer={isBridgeThingRuntime(sideBySide) ? id => {
           setPhoneVolumePlayerId(id);
           savePhoneVolumePlayerId(id);
           void setBridgeThingPhoneVolumePlayer(id).catch(() => showNotice("Phone volume saved on this device only"));
@@ -1609,14 +1616,14 @@ export default function App() {
         )}
       </section>
 
-      <nav className={sideBySide ? "navrail with-nocturne" : "navrail"}>
+      {!fullPlayer && <nav className={sideBySide ? "navrail with-nocturne" : "navrail"}>
         <NavButton active={view === "now"} label="Now" icon={<Home />} onClick={() => setView("now")} />
         <NavButton active={view === "library"} label="Library" icon={<Disc3 />} onClick={() => setView("library")} />
         <NavButton active={view === "players"} label="Players" icon={<Speaker />} onClick={() => setView("players")} />
         <NavButton active={view === "queue"} label="Queue" icon={<ListMusic />} onClick={openQueueView} />
         <NavButton active={view === "settings"} label="Setup" icon={<Settings />} onClick={() => setView("settings")} />
         {sideBySide && <NavButton active={false} label="Nocturne" icon={<ArrowLeft />} onClick={returnToNocturne} />}
-      </nav>
+      </nav>}
 
       {aiRadioSwitch && (
         <div className="ai-radio-backdrop">
@@ -1635,7 +1642,7 @@ export default function App() {
         </div>
       )}
       {notice && <div className="notice">{notice}</div>}
-      {volumePreview !== undefined && <VolumeOverlay volume={volumePreview} />}
+      {!volumeControl && (volumePreview ?? playerVolume.volume) !== undefined && <VolumeOverlay volume={(volumePreview ?? playerVolume.volume)!} />}
     </main>
   );
 }

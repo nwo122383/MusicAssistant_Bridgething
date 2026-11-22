@@ -10,7 +10,7 @@
 
 A Music Assistant controller for Spotify Car Thing running BridgeThing.
 
-**Latest release: 0.1.6.** [What's changed and upgrade notes](docs/releases/v0.1.6.md).
+**Latest release: 0.1.7.** [What's changed and upgrade notes](docs/releases/v0.1.7.md).
 
 ## Requirements
 
@@ -35,7 +35,7 @@ https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs
 ```
 
 For manual webapp installation, use
-[the 0.1.6 ZIP](docs/music-assistant-bridgething-v0.1.6.zip). This is an app bundle,
+[the 0.1.7 ZIP](docs/music-assistant-bridgething-v0.1.7.zip). This is an app bundle,
 **not** a Car Thing firmware image. The app ID stays the same across releases so
 BridgeThing can update an existing installation in place.
 
@@ -101,6 +101,7 @@ login remains available on the Car Thing setup screen.
 ## Features And Controls
 
 - Now Playing with artwork, elapsed time, shuffle, repeat, and transport controls.
+- Optional fullscreen Now Playing with larger artwork, text, and controls.
 - Library tabs for Recent, Playlists, Albums, Artists, Radio, and AI Radio.
 - Cached tab results, Recent/Playlists preloading, small first pages, Load More,
   and a refresh button. First loads and uncached artwork still depend on the link.
@@ -109,8 +110,11 @@ login remains available on the Car Thing setup screen.
 - Queue browsing, track selection, play-next, and removal.
 - Four physical preset buttons: select a library item and hold a top button to
   save it; press the button later to play it on the selected player.
-- Dial volume with an on-screen bar. The dial scrolls Players and selects queue
-  items in those views; pressing it plays the selected queue item in Queue.
+- Dial volume with an on-screen bar and equal 2-point changes across grouped
+  speakers. The Players volume panel also supports individual member control
+  without ungrouping and an explicit Sync to lowest action.
+- Outside the volume panel, the dial scrolls Players and selects queue items;
+  pressing it plays the selected queue item in Queue.
 - BridgeThing voice playback requests using the selected player. Availability
   and speech recognition depend on BridgeThing.
 - Phone settings for display size, Now Playing text size, and brightness.
@@ -118,6 +122,41 @@ login remains available on the Car Thing setup screen.
 **Ungroup All can affect multiple rooms and may stop playback.** It releases
 active grouping without deleting saved group definitions. Offline speakers may
 need to reconnect before MA can release them.
+
+## Group And Individual Volume
+
+For a grouped playback player, the normal volume dial changes each available,
+powered-on speaker by the same **2 points**. For example, levels of 9 and 24
+become 11 and 26 when turned up one step. This preserves the offset between
+speakers rather than proportionally scaling their levels. Each speaker is
+limited independently to 0-100.
+
+Open **Players** and tap the **sliders icon** beside a group or grouped speaker:
+
+- **Whole group** is selected by default. The dial adjusts all eligible members.
+- Select a member to adjust only that speaker with the dial. It remains in the
+  group, and the selected playback device does not change.
+- **Sync to lowest** is optional: pressing it sets eligible members to the
+  quietest member's level. It is a one-time action, not a background mode, and
+  never runs automatically when opening the panel or reconnecting. Equal-point
+  dial adjustments then keep those matched levels together, unless a member
+  reaches a limit or is changed separately.
+- **Done**, the close button, or leaving Players restores the normal dial target.
+  Volume changes already made are kept.
+
+Unavailable, powered-off, and non-volume-controllable members are skipped;
+these controls do not power on speakers or start playback. Nested groups are
+resolved to their controllable members without adjusting shared members twice.
+Group volume over Home Assistant/Nabu Casa uses MA ingress, as the group editor
+does, so that route needs the MA add-on and HA ingress access. Ordinary standalone
+HA volume and the configured Android phone-volume route remain unchanged.
+
+## Fullscreen Player
+
+Tap the small **expand icon** at the top-right of Now Playing to hide the bottom
+tabs and enlarge the artwork, track text, and playback controls. Tap the collapse
+icon in the same corner, or press the physical **Back** button, to restore the
+tabs. Playback continues. The normal layout and its size preferences are unchanged.
 
 ## AI Radio
 
@@ -192,11 +231,11 @@ The release command builds the app and phone settings page, packages the ZIP,
 copies the ZIP and matching hosted settings page into `docs/`, and updates
 the catalog's sizes, SHA-256 checksums, URLs, and release timestamp.
 
-For 0.1.6, the installable archive is written to:
+For 0.1.7, the installable archive is written to:
 
 ```text
-release/music-assistant-bridgething-v0.1.6.zip
-docs/music-assistant-bridgething-v0.1.6.zip
+release/music-assistant-bridgething-v0.1.7.zip
+docs/music-assistant-bridgething-v0.1.7.zip
 ```
 
 Commit and push the source, release notes, generated files in `docs/`, and

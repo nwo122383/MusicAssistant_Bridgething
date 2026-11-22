@@ -1,6 +1,6 @@
 {
   "schema": "catalog.v1",
-  "updated_at": "2026-11-21T23:56:47Z",
+  "updated_at": "2026-11-22T01:03:03.183Z",
   "repo": {
     "name": "Music Assistant BridgeThing",
     "description": "BridgeThing apps for Music Assistant.",
@@ -23,6 +23,26 @@
         "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/screenshots/ally-venable-now-playing-v0.1.6.png"
       ],
       "versions": [
+        {
+          "version": "0.1.7",
+          "permissions": [
+            "net.ws",
+            "net.proxy"
+          ],
+          "min_libbridgething_version": "0.17.1",
+          "changelog": "Adjust grouped speakers together in equal 2-point steps while preserving their volume offsets. Add a group-volume panel with individual member control without ungrouping and an optional, one-time Sync to lowest action. Add an enlarged fullscreen Now Playing layout with hidden navigation and touch/Back exits. Reduce background snapshot traffic while the volume panel is open.",
+          "download": {
+            "url": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/music-assistant-bridgething-v0.1.7.zip",
+            "size": 224297,
+            "sha256": "535e7fc270714ba82d9c0d71a9f585660f93eb62f0e7ad43cff9990bb023f6f5"
+          },
+          "settings": {
+            "url": "https://raw.githubusercontent.com/nwo122383/MusicAssistant_Bridgething/main/docs/music-assistant-bridgething-v0.1.7-settings.html",
+            "size": 365597,
+            "sha256": "2359e2eb93e0fa01f1212316c17b2a5a6e00689439125c140117dcb10caf650f"
+          },
+          "released_at": "2026-11-22T01:03:03.183Z"
+        },
         {
           "version": "0.1.6",
           "permissions": [

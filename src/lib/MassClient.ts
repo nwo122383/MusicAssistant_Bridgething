@@ -1,5 +1,6 @@
 import type { GroupPlayer, MassEvent, MassImage, MediaItem, Player, PlayerQueue, QueueItem } from "../types";
-import { membershipChanges, ungroupTargets } from "./playerGroups";
+import { isActivelyGrouped, membershipChanges, ungroupTargets } from "./playerGroups";
+import { clampVolume, readGroupVolume, type GroupVolumeInfo, type MemberVolume, type VolumeTarget } from "./playerVolume";
 import { createWebRtcSocket } from "./WebRtcSocket";
 import { setRemoteArtworkLoader, setRemoteArtworkScope } from "./remoteArtwork";
 import { connectionTimings } from "./connection";
@@ -46,6 +47,8 @@ export class MassClient {
   private haQueueHydrationSequence = new Map<string, number>();
   private haIngress?: { url: string; session: string; expires: number };
   private haPlayerEntityMap?: Map<string, string>;
+  private volumeWriteQueue: Promise<void> = Promise.resolve();
+  volumeRevision = 0;
 
   async connect(serverUrl: string, token?: string, transport: MassTransport = "direct", options: { tcpRelayOnly?: boolean } = {}): Promise<void> {
     this.disconnect();
@@ -212,16 +215,140 @@ export class MassClient {
     const players = await this.nativePlayerCommand<GroupPlayer[]>("players/all", { return_unavailable: true, return_disabled: true });
     if (!mapPlayback) return players;
     if (this.protocol !== "ha") return players.map(p => ({ ...p, playback_player_id: p.player_id }));
-    if (!this.haPlayerEntityMap) {
-      const registry = await this.haRequest<Array<{ entity_id: string; unique_id: string; platform: string; config_entry_id?: string }>>("config/entity_registry/list");
-      this.haPlayerEntityMap = new Map(registry.filter(entry => entry.platform === "music_assistant" &&
-        (!entry.config_entry_id || entry.config_entry_id === this.haMassConfigEntryId)).map(entry => [entry.unique_id, entry.entity_id]));
-    }
-    const entityMap = this.haPlayerEntityMap!;
+    const entityMap = await this.getHaPlayerEntityMap();
     return players.map(player => ({
       ...player,
       playback_player_id: entityMap.get(player.player_id) ?? entityMap.get(`mass_${player.player_id}`),
     }));
+  }
+
+  private async getHaPlayerEntityMap(): Promise<Map<string, string>> {
+    if (!this.haPlayerEntityMap) {
+      const epoch = this.connectionEpoch;
+      const registry = await this.haRequest<Array<{ entity_id: string; unique_id: string; platform: string; config_entry_id?: string }>>("config/entity_registry/list");
+      if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed");
+      this.haPlayerEntityMap = new Map(registry.filter(entry => entry.platform === "music_assistant" &&
+        (!entry.config_entry_id || entry.config_entry_id === this.haMassConfigEntryId)).map(entry => [entry.unique_id, entry.entity_id]));
+    }
+    return this.haPlayerEntityMap;
+  }
+
+  async getVolumeTarget(selected: Player, options: { individual?: boolean; nativeId?: boolean } = {}): Promise<VolumeTarget> {
+    const epoch = this.connectionEpoch;
+    const revision = this.volumeRevision;
+    if (this.protocol === "ha" && !options.nativeId && (options.individual || (selected.type !== "group" && !isActivelyGrouped(selected)))) {
+      return { playerId: selected.player_id, level: clampVolume(selected.volume_level), grouped: false, route: "homeassistant", connectionEpoch: epoch, revision };
+    }
+    let playerId = selected.player_id;
+    if (this.protocol === "ha" && !options.nativeId) {
+      const entityMap = await this.getHaPlayerEntityMap();
+      const ids = [...entityMap].filter(([, entity]) => entity === selected.player_id).map(([id]) => id);
+      if (ids.length !== 1) throw new Error("Unable to resolve the selected Music Assistant speaker for group volume");
+      playerId = ids[0];
+    }
+    const read = (id: string) => this.nativePlayerCommand<GroupPlayer | null>("players/get", { player_id: id });
+    let player = await read(playerId);
+    if (!player && this.protocol === "ha" && !options.nativeId && playerId.startsWith("mass_")) player = await read(playerId.slice(5));
+    const visited = new Set<string>();
+    while (player) {
+      if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed");
+      if (!player.available || player.enabled === false) throw new Error("The volume speaker is unavailable");
+      if (visited.has(player.player_id)) throw new Error("The speaker group changed. Refresh players and try again.");
+      visited.add(player.player_id);
+      const currentId = player.player_id;
+      // A mixer opened for an explicit native group controls that group only.
+      const parentId = !options.individual && !options.nativeId && [player.active_group, player.synced_to].find(id => id && id !== currentId);
+      if (parentId) { player = await read(parentId); continue; }
+      if (options.individual && player.type === "group") throw new Error("Select an individual speaker, not a virtual group");
+      const grouped = !options.individual && (player.type === "group" || isActivelyGrouped(player));
+      if (grouped) {
+        const info = await readGroupVolume(player, read);
+        if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed");
+        const members = info.members.map(member => ({ playerId: member.player_id, level: member.volume_level }));
+        return { playerId: player.player_id, level: Math.max(...members.map(member => member.level)), grouped: true, route: "native", connectionEpoch: epoch, revision, members, signature: info.signature };
+      }
+      const level = player.volume_level;
+      if (typeof level !== "number" || !Number.isFinite(level)) throw new Error("Volume is unavailable for this speaker group");
+      return { playerId: player.player_id, level: clampVolume(level), grouped, route: "native", connectionEpoch: epoch, revision };
+    }
+    throw new Error("The volume speaker is unavailable");
+  }
+
+  async setVolume(target: VolumeTarget, level: number): Promise<void> {
+    if (!Number.isFinite(level)) throw new Error("Invalid volume level");
+    await this.queueVolumeWrite(async () => {
+      this.checkVolumeTarget(target);
+      if (target.grouped) {
+        if (!target.members || !target.signature) throw new Error("Refresh the speaker group before adjusting its volume");
+        const current = await this.getGroupVolumeInfo(target.playerId);
+        this.checkVolumeTarget(target);
+        if (current.signature !== target.signature) throw new Error("The speaker group changed. Turn the dial again.");
+        const delta = level - target.level;
+        const desired = target.members.map(member => ({ ...member, level: clampVolume(member.level + delta) }));
+        await this.writeMemberVolumes(current, desired, target.connectionEpoch);
+      } else {
+        const args = { player_id: target.playerId, volume_level: clampVolume(level) };
+        if (target.route === "homeassistant") await this.command("players/cmd/volume_set", args);
+        else await this.nativePlayerCommand("players/cmd/volume_set", args);
+      }
+    });
+  }
+
+  async getGroupVolumeInfo(playerId: string): Promise<GroupVolumeInfo> {
+    const epoch = this.connectionEpoch;
+    const read = (id: string) => this.nativePlayerCommand<GroupPlayer | null>("players/get", { player_id: id });
+    const group = await read(playerId);
+    if (!group?.available || group.enabled === false) throw new Error("The volume group is unavailable");
+    if (group.type !== "group" && !isActivelyGrouped(group)) throw new Error("This speaker is no longer grouped");
+    const info = await readGroupVolume(group, read);
+    if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed");
+    return info;
+  }
+
+  async syncGroupVolume(playerId: string): Promise<{ level: number; count: number }> {
+    const epoch = this.connectionEpoch;
+    this.volumeRevision += 1;
+    let result!: { level: number; count: number };
+    await this.queueVolumeWrite(async () => {
+      if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed");
+      const current = await this.getGroupVolumeInfo(playerId);
+      if (current.members.length < 2) throw new Error("At least two powered-on speakers are needed to sync volume");
+      const level = Math.min(...current.members.map(member => member.volume_level));
+      await this.writeMemberVolumes(current, current.members.map(member => ({ playerId: member.player_id, level })), epoch);
+      result = { level, count: current.members.length };
+    });
+    return result;
+  }
+
+  private checkVolumeTarget(target: VolumeTarget): void {
+    if (target.connectionEpoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed. Turn the dial again.");
+    if (target.revision !== undefined && target.revision !== this.volumeRevision) throw new Error("Volume levels were matched. Turn the dial again.");
+  }
+
+  private async queueVolumeWrite(action: () => Promise<void>): Promise<void> {
+    const next = this.volumeWriteQueue.catch(() => {}).then(action);
+    this.volumeWriteQueue = next.catch(() => {});
+    await next;
+  }
+
+  private async writeMemberVolumes(current: GroupVolumeInfo, desired: MemberVolume[], epoch: number): Promise<void> {
+    const attempted: GroupPlayer[] = [];
+    try {
+      for (const member of current.members) {
+        if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed");
+        const next = desired.find(value => value.playerId === member.player_id);
+        if (!next || !Number.isFinite(next.level)) throw new Error("Speaker volume target is missing");
+        if (next.level === member.volume_level) continue;
+        attempted.push(member);
+        await this.nativePlayerCommand("players/cmd/volume_set", { player_id: member.player_id, volume_level: clampVolume(next.level) });
+      }
+    } catch (reason) {
+      for (const member of attempted.reverse()) {
+        if (epoch !== this.connectionEpoch) break;
+        try { await this.nativePlayerCommand("players/cmd/volume_set", { player_id: member.player_id, volume_level: member.volume_level }); } catch { /* A disconnected speaker may need a manual volume check. */ }
+      }
+      throw new Error(`Could not adjust all speakers. Check their volumes. ${reason instanceof Error ? reason.message : String(reason)}`);
+    }
   }
 
   async setGroupMembers(playerId: string, desired: string[], baseline: string[]): Promise<void> {
@@ -953,6 +1080,8 @@ export class MassClient {
       available: state.state !== "unavailable" && state.state !== "unknown",
       powered: state.state !== "off" && state.state !== "unavailable" && state.state !== "unknown",
       volume_level: volume,
+      type: typeof attributes.mass_player_type === "string" ? attributes.mass_player_type : undefined,
+      group_members: Array.isArray(attributes.group_members) ? attributes.group_members.filter((id: unknown): id is string => typeof id === "string") : undefined,
       volume_muted: attributes.is_volume_muted,
       state: state.state,
       active_source: state.entity_id,
@@ -1107,6 +1236,7 @@ type HaMediaAttributes = {
   shuffle?: boolean;
   repeat?: string;
   mass_player_type?: string;
+  group_members?: string[];
 };
 
 type HaMessage =

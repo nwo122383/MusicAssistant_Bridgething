@@ -32,21 +32,23 @@ export interface Player {
   powered: boolean;
   volume_level: number;
   volume_muted?: boolean;
+  volume_control?: string | null;
   state?: string;
   active_source?: string;
   group_childs?: string[];
+  type?: string;
+  group_members?: string[];
+  group_volume?: number | null;
+  synced_to?: string | null;
+  active_group?: string | null;
 }
 
 export interface GroupPlayer extends Player {
   provider?: string;
-  type?: string;
   enabled?: boolean;
   supported_features?: string[];
-  group_members?: string[];
   static_group_members?: string[];
   can_group_with?: string[];
-  synced_to?: string | null;
-  active_group?: string | null;
   playback_player_id?: string;
 }
 
