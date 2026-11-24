@@ -22,6 +22,8 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.EditText;
+import android.text.InputType;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -30,6 +32,7 @@ public final class MainActivity extends Activity {
     private TextView status;
     private Spinner devices;
     private SharedPreferences preferences;
+    private EditText server, playerName;
     private final List<BluetoothDevice> paired = new ArrayList<>();
     private final SharedPreferences.OnSharedPreferenceChangeListener changed = (prefs, key) -> refreshStatus();
 
@@ -46,15 +49,28 @@ public final class MainActivity extends Activity {
         layout.addView(title);
         status = new TextView(this); status.setTextSize(16); status.setTextColor(Color.LTGRAY);
         layout.addView(status);
+        server = new EditText(this); server.setHint("Home Assistant remote HTTPS URL");
+        server.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        server.setText(preferences.getString("ha_origin", "")); layout.addView(server);
+        addButton(layout, "Sign in to Home Assistant", () -> {
+            try {
+                String origin = ConnectionRules.origin(server.getText().toString());
+                saveName();
+                startActivity(new Intent(this, HaLoginActivity.class).putExtra("server", origin));
+            } catch (IllegalArgumentException error) { PlayerService.status(this, error.getMessage()); }
+        });
+        playerName = new EditText(this); playerName.setHint("Player name");
+        playerName.setSingleLine(true); playerName.setFilters(new android.text.InputFilter[] { new android.text.InputFilter.LengthFilter(64) });
+        playerName.setText(preferences.getString("player_name", "CarThing Phone")); layout.addView(playerName);
         addButton(layout, "Grant permissions", this::permissions);
         devices = new Spinner(this);
         layout.addView(devices);
         addButton(layout, "Enable automatic startup", this::associate);
         addButton(layout, "Connect phone player", () -> {
             if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) permissions();
-            else PlayerService.start(this);
+            else { saveName(); PlayerService.reconnect(this); }
         });
-        addButton(layout, "Stop helper", () -> stopService(new Intent(this, PlayerService.class)));
+        addButton(layout, "Stop phone player", () -> stopService(new Intent(this, PlayerService.class)));
         addButton(layout, "Disable automatic startup", this::disableAutomatic);
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.addView(layout);
         setContentView(scroll);
@@ -69,7 +85,13 @@ public final class MainActivity extends Activity {
     private void refreshStatus() {
         if (status == null) return;
         status.setText(preferences.getString("status", "Ready") + "\nAutomatic startup: " +
-            (preferences.getBoolean("automatic", false) ? "Enabled" : "Off"));
+            (preferences.getBoolean("automatic", false) ? "Enabled" : "Off") + "\n" +
+            (preferences.getBoolean("phone_ready", false) ? "Speaker: Available" : "Speaker: Not ready"));
+    }
+
+    private void saveName() {
+        String name = playerName.getText().toString().trim();
+        preferences.edit().putString("player_name", name.isEmpty() ? "CarThing Phone" : name).apply();
     }
 
     private void permissions() {
@@ -111,7 +133,7 @@ public final class MainActivity extends Activity {
         CompanionDeviceManager.Callback callback = new CompanionDeviceManager.Callback() {
             @Override public void onAssociationPending(IntentSender sender) { launchConsent(sender); }
             @Override public void onDeviceFound(IntentSender sender) { launchConsent(sender); }
-            @Override public void onAssociationCreated(AssociationInfo info) { observe(info.getId(), selected.getAddress()); }
+            @Override public void onAssociationCreated(AssociationInfo info) { if (Build.VERSION.SDK_INT >= 33) observe(info.getId(), selected.getAddress()); }
             @Override public void onFailure(CharSequence error) { PlayerService.status(MainActivity.this, "Device association was not completed"); }
         };
         if (Build.VERSION.SDK_INT >= 33) manager.associate(request, getMainExecutor(), callback);
@@ -125,6 +147,7 @@ public final class MainActivity extends Activity {
 
     private void observe(int id, String address) {
         try {
+            saveName();
             CompanionDeviceManager manager = getSystemService(CompanionDeviceManager.class);
             // Save before observation: an already-connected device can report presence immediately.
             preferences.edit().putInt("association", id).putString("address", address).putBoolean("automatic", true).apply();

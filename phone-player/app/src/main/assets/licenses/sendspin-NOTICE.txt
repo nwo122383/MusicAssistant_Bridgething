@@ -1,0 +1,11 @@
+CarThing Phone Player uses the Music Assistant Sendspin Kotlin engine.
+
+Upstream: https://github.com/music-assistant/mobile-app
+Version: sendspin-v0.1.0
+Commit: 7ef162da76bee24656cc5145f40ade2fdec72a27
+Copyright: Music Assistant contributors
+License: Apache License, Version 2.0 (see sendspin-LICENSE.txt).
+
+The engine's Kotlin source is unchanged. Its Android Gradle integration is
+adapted for this application's toolchain. This application is an independent
+Music Assistant / BridgeThing integration, not the official MA Android app.

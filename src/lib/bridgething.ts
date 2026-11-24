@@ -79,11 +79,48 @@ export async function subscribeBridgeThingVoice(handlers: BridgeThingVoiceHandle
 export async function subscribeBridgeThingBluetooth(handler: BridgeThingBluetoothHandler): Promise<() => void> {
   const { BridgethingClient } = await import("@bridgething/client");
   const client = new BridgethingClient();
+  let closed = false;
+  let probing = false;
+  let revision = 0;
+  let connected: boolean | undefined;
+  let timer: ReturnType<typeof window.setTimeout> | undefined;
+  const scheduleProbe = () => {
+    window.clearTimeout(timer);
+    if (!closed) timer = window.setTimeout(() => void probe(), connected === true ? 10_000 : 2_000);
+  };
+  const report = (connected: boolean) => {
+    revision += 1;
+    if (!closed) {
+      reportState(connected);
+      scheduleProbe();
+    }
+  };
+  const reportState = (value: boolean) => { connected = value; if (!closed) handler(value); };
   const unsubscribers = [
-    client.bluetooth.onStatus((status) => handler(status.connected)),
-    client.bluetooth.onConnectedDevice(() => handler(true)),
+    client.bluetooth.onStatus((status) => report(status.connected)),
+    client.bluetooth.onConnectedDevice(() => report(true)),
   ];
+  const probe = async () => {
+    if (closed || probing) return;
+    probing = true;
+    const startedAt = revision;
+    // A fresh SDK connection also detects recovery after a missed daemon event.
+    const probeClient = new BridgethingClient();
+    try {
+      const result = await probeClient.capabilities.get({ timeoutMs: 3_000 });
+      if (!closed && startedAt === revision && result.ok) reportState(!!result.response.capabilities.gateway);
+    } catch {
+      // An unanswered local RPC is unknown state, not proof the phone disconnected.
+    } finally {
+      probeClient.close();
+      probing = false;
+      scheduleProbe();
+    }
+  };
+  void probe();
   return () => {
+    closed = true;
+    window.clearTimeout(timer);
     unsubscribers.forEach((unsubscribe) => unsubscribe());
     client.close();
   };

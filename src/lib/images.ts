@@ -1,6 +1,19 @@
 import type { MassImage, MediaItem, QueueItem } from "../types";
 import { REMOTE_ARTWORK_BASE } from "./remoteArtwork";
 
+export function siriusXmArtworkUrl(value?: string): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password || url.port ||
+      (url.hostname !== "pri.art.prod.streaming.siriusxm.com" && url.hostname !== "albumart.siriusxm.com")) return undefined;
+    url.protocol = "https:";
+    url.hostname = "albumart.siriusxm.com";
+    url.hash = "";
+    return url.href;
+  } catch { return undefined; }
+}
+
 function isValidImage(img?: any): boolean {
   if (!img) return false;
   if (typeof img === "string") return img.trim().length > 0;

@@ -1,8 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { imageUrl, itemImage } from "./images";
+import { imageUrl, itemImage, siriusXmArtworkUrl } from "./images";
 import type { MediaItem, QueueItem } from "../types";
 
 describe("Music Assistant artwork helpers", () => {
+  it("uses SiriusXM's valid HTTPS artwork host without changing the asset path", () => {
+    expect(siriusXmArtworkUrl("https://pri.art.prod.streaming.siriusxm.com/covers/123.png?size=300"))
+      .toBe("https://albumart.siriusxm.com/covers/123.png?size=300");
+    expect(siriusXmArtworkUrl("http://albumart.siriusxm.com/cover.jpg"))
+      .toBe("https://albumart.siriusxm.com/cover.jpg");
+  });
+
+  it.each([
+    "https://albumart.siriusxm.com.evil.example/cover.png",
+    "https://evil.example/albumart.siriusxm.com/cover.png",
+    "https://user:secret@albumart.siriusxm.com/cover.png",
+    "https://albumart.siriusxm.com:8443/cover.png",
+    "file:///cover.png", "not a URL",
+  ])("never rewrites untrusted or credentialed artwork URLs: %s", url => {
+    expect(siriusXmArtworkUrl(url)).toBeUndefined();
+  });
+
   it("finds metadata artwork on media items", () => {
     const item = {
       uri: "library://track/1",

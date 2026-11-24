@@ -1,7 +1,7 @@
 {
   "name": "music-assistant-bridgething",
   "private": true,
-  "version": "0.1.7",
+  "version": "0.1.8-beta.1",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -17,6 +17,7 @@
   "dependencies": {
     "@bridgething/client": "^0.9.3",
     "@bridgething/settings-client": "npm:@bridgething/client@0.17.0",
+    "@noble/hashes": "2.0.1",
     "@scure/base": "^2.2.0",
     "@vitejs/plugin-react": "latest",
     "express": "latest",

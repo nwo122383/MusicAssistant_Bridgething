@@ -5,6 +5,7 @@ import "./style.css";
 import { validateConnection, normalizeRemoteId } from "../src/lib/connection";
 import { MassClient } from "../src/lib/MassClient";
 import { Link, LoaderCircle, LogIn, X } from "lucide-react";
+import { decodeHaSession, encodeHaSession, signInToHomeAssistant } from "../src/lib/homeAssistantAuth";
 
 type Values = {
   serverUrl: string;
@@ -78,10 +79,16 @@ export function SettingsApp() {
   const [authStage, setAuthStage] = useState<"idle" | "connecting" | "login" | "signingIn">("idle");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [haSigningIn, setHaSigningIn] = useState(false);
+  const haAuthRevision = useRef(0);
+  const haAuthActive = useRef(false);
   const contextRevision = useRef(0);
   const authSession = useRef<{ client: MassClient; revision: number; remoteId: string } | undefined>(undefined);
 
   const cancelAuth = () => {
+    haAuthRevision.current += 1;
+    haAuthActive.current = false;
+    setHaSigningIn(false);
     const session = authSession.current;
     authSession.current = undefined;
     session?.client.disconnect();
@@ -126,19 +133,20 @@ export function SettingsApp() {
       }
     };
     void load();
-    const offRefresh = settings.onRefresh(() => void load());
+    const offRefresh = settings.onRefresh(() => { if (!haAuthActive.current) void load(); });
     const offContext = settings.onContextChanged(() => void load());
     return () => {
       cancelled = true;
       authSession.current?.client.disconnect();
       authSession.current = undefined;
+      haAuthRevision.current += 1;
       offRefresh();
       offContext();
     };
   }, []);
 
   const setValue = <K extends keyof Values>(key: K, value: Values[K]) => {
-    if (key === "remoteId" || key === "transport") cancelAuth();
+    if (key === "remoteId" || key === "transport" || key === "serverUrl") cancelAuth();
     setValues((current) => ({ ...current, [key]: value,
       ...(key === "transport" && value !== current.transport || key === "remoteId" && normalizeRemoteId(String(value)) !== normalizeRemoteId(current.remoteId) ? { token: "" } : {}),
     }));
@@ -229,6 +237,38 @@ export function SettingsApp() {
     }
   };
 
+  const signInHa = async () => {
+    const validationError = validate(values);
+    if (validationError) { setStatus(validationError); return; }
+    cancelAuth();
+    const revision = haAuthRevision.current;
+    const context = contextRevision.current;
+    const current = () => haAuthRevision.current === revision && contextRevision.current === context;
+    haAuthActive.current = true;
+    setHaSigningIn(true);
+    setStatus("Signing in to Home Assistant");
+    try {
+      const session = await signInToHomeAssistant(values.serverUrl, {
+        authorize: url => settings.auth.authorize(url),
+        fetch: (url, init) => settings.fetch(url, { ...init, timeoutMs: 20_000 }),
+      }, current);
+      if (!current()) return;
+      const next = { ...values, serverUrl: session.origin, token: encodeHaSession(session) };
+      setValues(next);
+      await saveValues(next, context);
+    } catch (error) {
+      if (current()) setStatus(error instanceof Error && !/https?:\/\//.test(error.message) ? error.message : "Home Assistant sign-in did not complete");
+    } finally { if (current()) { haAuthActive.current = false; setHaSigningIn(false); } }
+  };
+
+  const haSignedIn = (() => {
+    try { return values.transport === "homeassistant" && !!decodeHaSession(values.token, values.serverUrl); }
+    catch { return false; }
+  })();
+
+  const tokenField = <label>{tokenLabel(values.transport)}<input value={values.token}
+    onChange={event => setValue("token", event.target.value)} placeholder={tokenPlaceholder(values.transport)} type="password" /></label>;
+
   return (
     <main>
       <h1>Music Assistant</h1>
@@ -245,6 +285,7 @@ export function SettingsApp() {
             onChange={(event) => setValue("serverUrl", event.target.value)}
             placeholder={urlPlaceholder(values.transport)}
             inputMode="url"
+            disabled={saving || haSigningIn}
           />
         </label>
         )}
@@ -266,19 +307,19 @@ export function SettingsApp() {
             )}
           </section>
         )}
-        <label>
-          {tokenLabel(values.transport)}
-          <input
-            value={values.token}
-            onChange={(event) => setValue("token", event.target.value)}
-            placeholder={tokenPlaceholder(values.transport)}
-            type="password"
-          />
-        </label>
+        {values.transport === "homeassistant" ? <section className="setting-group">
+          <button type="button" onClick={() => void signInHa()} disabled={saving || haSigningIn}>
+            {haSigningIn ? <LoaderCircle size={18} /> : <LogIn size={18} />} {haSigningIn ? "Signing in" : haSignedIn ? "Sign in again to Home Assistant" : "Sign in to Home Assistant"}
+          </button>
+          {status && <p role="status" aria-live="polite">{status}</p>}
+          {haSignedIn && <p role="status">Signed in</p>}
+          {!haSignedIn && <details><summary>Advanced access token</summary>{tokenField}</details>}
+        </section> : tokenField}
         <label>
           Connection path
           <select
             value={values.transport}
+            disabled={saving || haSigningIn}
             onChange={(event) => setValue("transport", event.target.value as Values["transport"])}
           >
             <option value="homeassistant">Home Assistant / Nabu Casa</option>
@@ -334,13 +375,13 @@ export function SettingsApp() {
           </label>
         </section>
         <div className="actions">
-          <button type="submit" disabled={saving}>{saving ? "Saving..." : "Save"}</button>
+          <button type="submit" disabled={saving || haSigningIn}>{saving ? "Saving..." : "Save"}</button>
           <button type="button" onClick={() => settings.done()}>
             Done
           </button>
         </div>
       </form>
-      {status && <p>{status}</p>}
+      {values.transport !== "homeassistant" && status && <p role="status" aria-live="polite">{status}</p>}
     </main>
   );
 }

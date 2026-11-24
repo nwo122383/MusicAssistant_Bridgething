@@ -16,4 +16,11 @@ android-relay/app/build/
 phone-player/.gradle/
 phone-player/build/
 phone-player/app/build/
+phone-player/sendspin/build/
+phone-player/.kotlin/
 phone-player/local.properties
+phone-player/*.keystore
+phone-player/*.jks
+phone-player/signing.properties
+docs/bridgething-bluetooth-startup-report.md
+docs/native-phone-player-feasibility.md

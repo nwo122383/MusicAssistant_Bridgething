@@ -2,10 +2,16 @@ import type { GroupPlayer, MassEvent, MassImage, MediaItem, Player, PlayerQueue,
 import { isActivelyGrouped, membershipChanges, ungroupTargets } from "./playerGroups";
 import { clampVolume, readGroupVolume, type GroupVolumeInfo, type MemberVolume, type VolumeTarget } from "./playerVolume";
 import { createWebRtcSocket } from "./WebRtcSocket";
-import { setRemoteArtworkLoader, setRemoteArtworkScope } from "./remoteArtwork";
+import { REMOTE_ARTWORK_BASE, setRemoteArtworkLoader, setRemoteArtworkScope } from "./remoteArtwork";
+import { imageUrl, siriusXmArtworkUrl } from "./images";
 import { connectionTimings } from "./connection";
+import { decodeHaSession, refreshHaSession, HaSignInRequired, type HaSession } from "./homeAssistantAuth";
+import { isCompanionPhonePlayer } from "./phonePlayer";
+import type { StartupPhase } from "./startupDiagnostics";
 
 type MassTransport = "direct" | "bridgething" | "homeassistant" | "webrtc";
+export type PlaybackSnapshot = { players: Player[]; queues: PlayerQueue[] };
+type HaIngress = { url: string; session: string; expires: number };
 
 const HA_CONNECT_TIMEOUT_MS = 30_000;
 const HA_COMMAND_TIMEOUT_MS = 12_000;
@@ -18,7 +24,10 @@ type Pending = {
   parts: unknown[];
   timeout: number;
   eventResult?: "template" | "entities";
+  pong?: boolean;
 };
+
+class ServerResponseError extends Error {}
 
 type TransportSocket = {
   ready?: Promise<void>;
@@ -37,6 +46,8 @@ export class MassClient {
   private haSequence = 0;
   private serverReady?: () => void;
   private connectionEpoch = 0;
+  private serverResponseAt = 0;
+  private serverResponseRevision = 0;
   private cancelConnection?: () => void;
   private protocol: "mass" | "ha" = "mass";
   private haBaseUrl = "";
@@ -45,14 +56,38 @@ export class MassClient {
   private haRefreshInFlight?: Promise<void>;
   private haHydratedQueues = new Map<string, PlayerQueue>();
   private haQueueHydrationSequence = new Map<string, number>();
-  private haIngress?: { url: string; session: string; expires: number };
+  private haIngress?: HaIngress;
+  private haIngressInFlight?: Promise<HaIngress>;
   private haPlayerEntityMap?: Map<string, string>;
+  private haAuthCache?: { credential: string; session: HaSession };
+  private haRejectedCredential?: string;
+  private haCompanionDiscovery = false;
+  private haCompanionPlayers: Player[] = [];
+  private haCompanionPlayersAt = 0;
+  private haCompanionPlayersInFlight?: Promise<Player[]>;
+  private haCompanionPlayerIds = new Set<string>();
+  private startupPhonePlayerId?: string;
+  private priorityPhonePlayerId?: string;
+  private startupSnapshot?: PlaybackSnapshot;
+  private haInitializationDeferred = false;
+  private haStatesReady = false;
+  private haInitializationInFlight?: Promise<void>;
+  private haWarmupTimer?: number;
+  private startupPhase?: (phase: StartupPhase) => void;
   private volumeWriteQueue: Promise<void> = Promise.resolve();
   volumeRevision = 0;
 
-  async connect(serverUrl: string, token?: string, transport: MassTransport = "direct", options: { tcpRelayOnly?: boolean } = {}): Promise<void> {
+  async connect(serverUrl: string, token?: string, transport: MassTransport = "direct", options: {
+    tcpRelayOnly?: boolean; startupPhonePlayerId?: string; onStartupPhase?: (phase: StartupPhase) => void;
+  } = {}): Promise<void> {
     this.disconnect();
     const epoch = this.connectionEpoch;
+    this.startupPhonePlayerId = transport === "homeassistant" && /^[A-Za-z0-9_-]{43}$/.test(options.startupPhonePlayerId || "")
+      ? options.startupPhonePlayerId : undefined;
+    this.startupPhase = phase => {
+      if (epoch !== this.connectionEpoch) return;
+      try { options.onStartupPhase?.(phase); } catch { /* Diagnostics must not change connection behavior. */ }
+    };
     const base = serverUrl.replace(/\/$/, "");
     this.commandTimeoutMs = connectionTimings(transport).commandMs;
     setRemoteArtworkScope(JSON.stringify([transport, base, token ?? ""]));
@@ -92,6 +127,7 @@ export class MassClient {
       const handleMessage = (rawData: string) => {
         if (epoch !== this.connectionEpoch) return;
         const data = JSON.parse(rawData) as Record<string, unknown>;
+        this.recordServerResponse();
         if ("server_id" in data && "server_version" in data) {
           this.serverReady?.();
           return;
@@ -111,6 +147,7 @@ export class MassClient {
         try {
           if (token) await this.command("auth", { token, device_name: "Car Thing" });
           if (!settled) {
+            this.startupPhase?.("server_connected");
             if (transport === "webrtc") {
               const socket = this.socket as ReturnType<typeof createWebRtcSocket>;
               setRemoteArtworkLoader(path => socket.fetchImage(path, token));
@@ -173,6 +210,32 @@ export class MassClient {
 
   command<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T> {
     if (this.protocol === "ha") return this.haCommand<T>(command, args);
+    return this.massCommand<T>(command, args);
+  }
+
+  get connectionGeneration(): number { return this.connectionEpoch; }
+  get lastResponseAt(): number { return this.serverResponseAt; }
+  get responseRevision(): number { return this.serverResponseRevision; }
+
+  private recordServerResponse(): void {
+    this.serverResponseAt = Date.now();
+    this.serverResponseRevision += 1;
+  }
+
+  async probeConnection(): Promise<boolean> {
+    if (!this.isConnected()) return false;
+    const epoch = this.connectionEpoch;
+    try {
+      if (this.protocol === "ha") await this.haRequestWithPending("ping", {}, undefined, 8_000);
+      else await this.massCommand("info", undefined, 8_000);
+      return epoch === this.connectionEpoch && this.isConnected();
+    } catch (error) {
+      // A server rejection still proves that this socket can exchange messages.
+      return error instanceof ServerResponseError && epoch === this.connectionEpoch && this.isConnected();
+    }
+  }
+
+  private massCommand<T>(command: string, args?: Record<string, unknown>, timeoutMs = this.commandTimeoutMs): Promise<T> {
     if (!this.socket?.isOpen()) {
       return Promise.reject(new Error("Music Assistant is not connected"));
     }
@@ -181,14 +244,19 @@ export class MassClient {
       const timeout = window.setTimeout(() => {
         this.pending.delete(messageId);
         reject(new Error(`Music Assistant command timed out: ${command}`));
-      }, this.commandTimeoutMs);
+      }, timeoutMs);
       this.pending.set(messageId, {
         resolve: resolve as (value: unknown) => void,
         reject,
         parts: [],
         timeout,
       });
-      this.socket!.send(JSON.stringify({ message_id: messageId, command, args }));
+      try { this.socket!.send(JSON.stringify({ message_id: messageId, command, args })); }
+      catch (error) {
+        clearTimeout(timeout);
+        this.pending.delete(messageId);
+        reject(error);
+      }
     });
   }
 
@@ -206,6 +274,42 @@ export class MassClient {
     return this.socket?.isOpen() === true;
   }
 
+  enablePhonePlayerDiscovery(playerId?: string): void {
+    this.haCompanionDiscovery = true;
+    if (playerId && !playerId.startsWith("media_player.")) this.haCompanionPlayerIds.add(playerId);
+  }
+
+  prioritizePhonePlayer(playerId?: string): void {
+    this.priorityPhonePlayerId = this.haCompanionPlayers.some(player => player.player_id === playerId && isCompanionPhonePlayer(player))
+      ? playerId : undefined;
+  }
+
+  takeStartupSnapshot(): PlaybackSnapshot | undefined {
+    const snapshot = this.startupSnapshot;
+    this.startupSnapshot = undefined;
+    return snapshot;
+  }
+
+  async getPlaybackTarget(playerId: string, phonePlayerId: string): Promise<{ player: Player; queueId: string }> {
+    const epoch = this.connectionEpoch;
+    const player = await this.command<Player | null>("players/get", { player_id: playerId });
+    if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed. Try again.");
+    if (!player || player.player_id !== playerId || !player.available) {
+      throw new Error(playerId === phonePlayerId ? "Waiting for phone audio" : "The selected player is unavailable");
+    }
+    const isPhone = !!phonePlayerId && playerId === phonePlayerId;
+    if (isPhone && ([player.synced_to, player.active_group].some(id => id && id !== playerId) ||
+      [...(player.group_members || []), ...(player.group_childs || [])].some(id => id !== playerId))) {
+      throw new Error("Ungroup the phone player before starting car playback");
+    }
+    const queue = await this.command<PlayerQueue | null>("player_queues/get", { queue_id: playerId });
+    if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed. Try again.");
+    // The assigned phone can only use its own queue, never a former home-group source.
+    const queueId = queue?.queue_id === playerId ? playerId : isPhone ? undefined : player.active_source;
+    if (!queueId) throw new Error(isPhone ? "Waiting for phone audio" : "The selected player has no playback queue");
+    return { player, queueId };
+  }
+
   async nativePlayerCommand<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T> {
     if (command === "players/cmd/set_members" || command === "players/cmd/ungroup") this.haPlayerEntityMap = undefined;
     return this.protocol === "ha" ? await this.haMassCommand(command, args) as T : this.command<T>(command, args);
@@ -213,16 +317,23 @@ export class MassClient {
 
   async getGroupPlayers(mapPlayback = true): Promise<GroupPlayer[]> {
     const players = await this.nativePlayerCommand<GroupPlayer[]>("players/all", { return_unavailable: true, return_disabled: true });
+    if (this.protocol === "ha" && players.some(isCompanionPhonePlayer)) {
+      this.haCompanionDiscovery = true;
+      this.haCompanionPlayers = players.filter(isCompanionPhonePlayer);
+      this.haCompanionPlayers.forEach(p => this.haCompanionPlayerIds.add(p.player_id));
+      this.haCompanionPlayersAt = Date.now();
+    }
     if (!mapPlayback) return players;
     if (this.protocol !== "ha") return players.map(p => ({ ...p, playback_player_id: p.player_id }));
     const entityMap = await this.getHaPlayerEntityMap();
     return players.map(player => ({
       ...player,
-      playback_player_id: entityMap.get(player.player_id) ?? entityMap.get(`mass_${player.player_id}`),
+      playback_player_id: isCompanionPhonePlayer(player) ? player.player_id : entityMap.get(player.player_id) ?? entityMap.get(`mass_${player.player_id}`),
     }));
   }
 
   private async getHaPlayerEntityMap(): Promise<Map<string, string>> {
+    if (this.haInitializationDeferred && !this.haStatesReady) await this.initializeHomeAssistantStates();
     if (!this.haPlayerEntityMap) {
       const epoch = this.connectionEpoch;
       const registry = await this.haRequest<Array<{ entity_id: string; unique_id: string; platform: string; config_entry_id?: string }>>("config/entity_registry/list");
@@ -236,11 +347,12 @@ export class MassClient {
   async getVolumeTarget(selected: Player, options: { individual?: boolean; nativeId?: boolean } = {}): Promise<VolumeTarget> {
     const epoch = this.connectionEpoch;
     const revision = this.volumeRevision;
-    if (this.protocol === "ha" && !options.nativeId && (options.individual || (selected.type !== "group" && !isActivelyGrouped(selected)))) {
+    const companion = isCompanionPhonePlayer(selected);
+    if (this.protocol === "ha" && !options.nativeId && !companion && (options.individual || (selected.type !== "group" && !isActivelyGrouped(selected)))) {
       return { playerId: selected.player_id, level: clampVolume(selected.volume_level), grouped: false, route: "homeassistant", connectionEpoch: epoch, revision };
     }
     let playerId = selected.player_id;
-    if (this.protocol === "ha" && !options.nativeId) {
+    if (this.protocol === "ha" && !options.nativeId && !companion) {
       const entityMap = await this.getHaPlayerEntityMap();
       const ids = [...entityMap].filter(([, entity]) => entity === selected.player_id).map(([id]) => id);
       if (ids.length !== 1) throw new Error("Unable to resolve the selected Music Assistant speaker for group volume");
@@ -376,11 +488,27 @@ export class MassClient {
 
   disconnect(): void {
     this.connectionEpoch += 1;
+    this.serverResponseAt = 0;
     this.cancelConnection?.();
     this.cancelConnection = undefined;
     setRemoteArtworkLoader(undefined);
     this.haPlayerEntityMap = undefined;
     this.haIngress = undefined;
+    this.haIngressInFlight = undefined;
+    this.haCompanionPlayers = [];
+    this.haCompanionPlayersAt = 0;
+    this.haCompanionPlayersInFlight = undefined;
+    this.haCompanionPlayerIds.clear();
+    this.startupPhonePlayerId = undefined;
+    this.priorityPhonePlayerId = undefined;
+    this.startupSnapshot = undefined;
+    this.haInitializationDeferred = false;
+    this.haStatesReady = false;
+    this.haInitializationInFlight = undefined;
+    this.haRefreshInFlight = undefined;
+    clearTimeout(this.haWarmupTimer);
+    this.haWarmupTimer = undefined;
+    this.startupPhase = undefined;
     this.socket?.close();
     this.socket = undefined;
     this.haStates.clear();
@@ -397,7 +525,7 @@ export class MassClient {
     if (message.error_code) {
       this.pending.delete(id);
       clearTimeout(pending.timeout);
-      pending.reject(new Error(String(message.details ?? message.error_code)));
+      pending.reject(new ServerResponseError(String(message.details ?? message.error_code)));
       return;
     }
     if (message.partial) {
@@ -422,8 +550,36 @@ export class MassClient {
   }
 
   private async connectHomeAssistant(base: string, token?: string): Promise<void> {
-    if (!token) throw new Error("Home Assistant long-lived access token is required");
+    if (!token) throw new Error("Sign in to Home Assistant in BridgeThing settings");
+    const epoch = this.connectionEpoch;
     base = new URL(base).origin;
+    const credential = token;
+    const decoded = decodeHaSession(credential, base);
+    if (decoded) {
+      if (this.haRejectedCredential === credential) throw new HaSignInRequired("Sign in to Home Assistant again in BridgeThing settings");
+      let session = this.haAuthCache?.credential === credential ? this.haAuthCache.session : decoded;
+      if (session.expiresAt <= Date.now() + 60_000) {
+        const bridge = await importBridgeThingClient();
+        try {
+          session = await refreshHaSession(session, async (url, init) => {
+            const result = await bridge.net.fetch({ request: {
+              url, method: "POST", headers: [{ name: "Content-Type", value: "application/x-www-form-urlencoded" }],
+              body: new TextEncoder().encode(String(init.body)), timeoutMs: 15_000, redirect: "error",
+            } }, { timeoutMs: 18_000 });
+            if (!result.ok) throw new Error("Unable to refresh Home Assistant sign-in through the phone");
+            const response = result.response.response;
+            return new Response(new TextDecoder().decode(response.body), { status: response.status });
+          });
+        } catch (error) {
+          if (error instanceof HaSignInRequired) this.haRejectedCredential = credential;
+          throw error;
+        } finally { bridge.close(); }
+      }
+      if (epoch !== this.connectionEpoch) throw new Error("Connection replaced");
+      this.haAuthCache = { credential, session };
+      token = session.accessToken;
+    }
+    if (epoch !== this.connectionEpoch) throw new Error("Connection replaced");
     this.protocol = "ha";
     this.haBaseUrl = base;
     this.haStates.clear();
@@ -436,36 +592,44 @@ export class MassClient {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        const socket = this.socket;
-        this.socket = undefined;
-        socket?.close();
-        this.rejectPending(error);
+        if (epoch === this.connectionEpoch) {
+          this.cancelConnection = undefined;
+          const socket = this.socket;
+          this.socket = undefined;
+          socket?.close();
+          this.rejectPending(error);
+        }
         reject(error);
       };
       const handleClose = () => {
+        if (epoch !== this.connectionEpoch) return;
+        const socket = this.socket;
         this.socket = undefined;
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-          this.rejectPending(new Error("Home Assistant connection closed"));
-          this.closeListeners.forEach((listener) => listener());
-        }
+        if (!settled) fail(new Error("Home Assistant connection closed"));
+        socket?.close();
+        this.rejectPending(new Error("Home Assistant connection closed"));
+        this.closeListeners.forEach((listener) => listener());
       };
       const handleMessage = (rawData: string) => {
+        if (epoch !== this.connectionEpoch) return;
         const data = JSON.parse(rawData) as HaMessage;
+        this.recordServerResponse();
         if (data.type === "auth_required") {
           this.socket?.send(JSON.stringify({ type: "auth", access_token: token }));
           return;
         }
         if (data.type === "auth_invalid") {
+          if (decoded) this.haAuthCache = { credential, session: { ...this.haAuthCache!.session, expiresAt: 0 } };
           fail(new Error("Home Assistant rejected the access token"));
           return;
         }
         if (data.type === "auth_ok") {
+          this.startupPhase?.("server_connected");
           void this.finishHomeAssistantConnect().then(() => {
-            if (!settled) {
+            if (!settled && epoch === this.connectionEpoch) {
               settled = true;
               clearTimeout(timeout);
+              this.cancelConnection = undefined;
               resolve();
             }
           }, (error) => fail(error instanceof Error ? error : new Error(String(error))));
@@ -475,9 +639,19 @@ export class MassClient {
           this.handleHaResult(data);
           return;
         }
+        if (data.type === "pong") {
+          const pending = this.pending.get(String(data.id));
+          if (pending?.pong) {
+            this.pending.delete(String(data.id));
+            clearTimeout(pending.timeout);
+            pending.resolve(undefined);
+          }
+          return;
+        }
         if (data.type === "event") this.handleHaEvent(data);
       };
 
+      this.cancelConnection = () => fail(new Error("Connection replaced"));
       timeout = window.setTimeout(() => fail(new Error("Home Assistant did not respond")), HA_CONNECT_TIMEOUT_MS);
       const socket = createBridgeThingSocket(wsUrl, handleMessage, handleClose);
       this.socket = socket;
@@ -488,19 +662,91 @@ export class MassClient {
   }
 
   private async finishHomeAssistantConnect(): Promise<void> {
-    await this.loadHomeAssistantConfigEntry();
-    const entityIds = await this.discoverHaPlayerEntityIds();
-    if (entityIds.length) {
-      await this.haRequestWithPending<null>("subscribe_entities", { entity_ids: entityIds }, "entities");
+    const epoch = this.connectionEpoch;
+    setRemoteArtworkLoader(path => this.fetchHaCompanionArtwork(path));
+    const id = this.startupPhonePlayerId;
+    if (id) {
+      let deadline = 0;
+      let expired = false;
+      try {
+        const read = async (): Promise<{ player: Player; queue: PlayerQueue | null } | undefined> => {
+          const player = await this.haMassCommand("players/get", { player_id: id }) as Player | null;
+          if (epoch !== this.connectionEpoch) throw new Error("Connection replaced");
+          if (expired) return undefined;
+          if (player?.player_id !== id || !isCompanionPhonePlayer(player)) return undefined;
+          const queue = player.available ? await this.haMassCommand("player_queues/get", { queue_id: id }) as PlayerQueue | null : null;
+          if (epoch !== this.connectionEpoch) throw new Error("Connection replaced");
+          if (queue && queue.queue_id !== id) return undefined;
+          return { player, queue };
+        };
+        const snapshot = await Promise.race([
+          read(),
+          new Promise<undefined>(resolve => { deadline = window.setTimeout(() => { expired = true; resolve(undefined); }, 8_000); }),
+        ]);
+        if (epoch !== this.connectionEpoch) throw new Error("Connection replaced");
+        if (snapshot) {
+          const { player, queue } = snapshot;
+          this.enablePhonePlayerDiscovery(id);
+          this.haCompanionPlayers = [player];
+          this.haCompanionPlayersAt = Date.now();
+          this.priorityPhonePlayerId = id;
+          this.haInitializationDeferred = true;
+          this.startupSnapshot = { players: [player], queues: queue ? [this.haCompanionQueue(queue)!] : [] };
+          this.startupPhase?.("phone_snapshot_ready");
+          this.scheduleHaWarmup();
+          return;
+        }
+      } catch (error) {
+        if (epoch !== this.connectionEpoch) throw error;
+        // A fast-path miss is optional; retain the established HA startup path.
+      } finally { expired = true; clearTimeout(deadline); }
     }
+    await this.initializeHomeAssistantStates();
+  }
+
+  private async initializeHomeAssistantStates(): Promise<void> {
+    if (this.haStatesReady) return;
+    if (this.haInitializationInFlight) return this.haInitializationInFlight;
+    const epoch = this.connectionEpoch;
+    const assertCurrent = () => { if (epoch !== this.connectionEpoch) throw new Error("Connection replaced"); };
+    const run = (async () => {
+      await this.loadHomeAssistantConfigEntry();
+      assertCurrent();
+      const entityIds = await this.discoverHaPlayerEntityIds();
+      assertCurrent();
+      if (entityIds.length) await this.haRequestWithPending<null>("subscribe_entities", { entity_ids: entityIds }, "entities");
+      assertCurrent();
+      this.haStatesReady = true;
+      clearTimeout(this.haWarmupTimer);
+      this.haWarmupTimer = undefined;
+      this.startupPhase?.("home_players_ready");
+    })();
+    this.haInitializationInFlight = run;
+    try { await run; }
+    finally { if (this.haInitializationInFlight === run) this.haInitializationInFlight = undefined; }
+  }
+
+  private scheduleHaWarmup(delay = 5_000): void {
+    if (this.haWarmupTimer !== undefined || this.haStatesReady) return;
+    const epoch = this.connectionEpoch;
+    this.haWarmupTimer = window.setTimeout(() => {
+      this.haWarmupTimer = undefined;
+      if (epoch !== this.connectionEpoch || !this.isConnected()) return;
+      void this.initializeHomeAssistantStates().catch(() => {
+        if (epoch !== this.connectionEpoch) return;
+        this.startupPhase?.("home_warmup_failed");
+        this.scheduleHaWarmup(30_000);
+      });
+    }, delay);
   }
 
   private async loadHomeAssistantConfigEntry(): Promise<void> {
+    const epoch = this.connectionEpoch;
     try {
       const entries = await this.haRequest<HaConfigEntry[]>("config_entries/get", { domain: "music_assistant" });
-      this.haMassConfigEntryId = entries.find((entry) => entry.state === "loaded")?.entry_id || entries[0]?.entry_id || "";
+      if (epoch === this.connectionEpoch) this.haMassConfigEntryId = entries.find((entry) => entry.state === "loaded")?.entry_id || entries[0]?.entry_id || "";
     } catch {
-      this.haMassConfigEntryId = "";
+      if (epoch === this.connectionEpoch) this.haMassConfigEntryId = "";
     }
   }
 
@@ -512,6 +758,7 @@ export class MassClient {
     type: string,
     payload: Record<string, unknown> = {},
     eventResult?: Pending["eventResult"],
+    timeoutMs = HA_COMMAND_TIMEOUT_MS,
   ): Promise<T> {
     if (!this.socket?.isOpen()) {
       return Promise.reject(new Error("Home Assistant is not connected"));
@@ -521,15 +768,21 @@ export class MassClient {
       const timeout = window.setTimeout(() => {
         this.pending.delete(String(messageId));
         reject(new Error(`Home Assistant command timed out: ${type}`));
-      }, HA_COMMAND_TIMEOUT_MS);
+      }, timeoutMs);
       this.pending.set(String(messageId), {
         resolve: resolve as (value: unknown) => void,
         reject,
         parts: [],
         timeout,
         eventResult,
+        pong: type === "ping",
       });
-      this.socket!.send(JSON.stringify({ id: messageId, type, ...payload }));
+      try { this.socket!.send(JSON.stringify({ id: messageId, type, ...payload })); }
+      catch (error) {
+        clearTimeout(timeout);
+        this.pending.delete(String(messageId));
+        reject(error);
+      }
     });
   }
 
@@ -539,7 +792,7 @@ export class MassClient {
     if (!message.success) {
       this.pending.delete(String(message.id));
       clearTimeout(pending.timeout);
-      pending.reject(new Error(message.error?.message || message.error?.code || "Home Assistant command failed"));
+      pending.reject(new ServerResponseError(message.error?.message || message.error?.code || "Home Assistant command failed"));
       return;
     }
     if (pending.eventResult) return;
@@ -573,18 +826,54 @@ export class MassClient {
     const previous = this.haStates.get(entity.entity_id);
     this.haStates.set(entity.entity_id, entity);
     this.emitHaState(entity);
-    if (this.haMediaIdentityChanged(previous, entity)) void this.emitHydratedHaQueue(entity.entity_id);
+    if (!this.priorityPhonePlayerId && this.haMediaIdentityChanged(previous, entity)) void this.emitHydratedHaQueue(entity.entity_id);
   }
 
   private async haCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+    const target = String(args?.player_id || args?.queue_id || args?.player_id_override || "");
+    if (this.haInitializationDeferred && !this.haStatesReady && (command.startsWith("music/") || target.startsWith("media_player."))) {
+      await this.initializeHomeAssistantStates();
+    }
     if (command.startsWith("ai_radio/")) return await this.haAiRadioCommand(command, args) as T;
     if (command === "players/all") {
+      if (!this.priorityPhonePlayerId && this.haInitializationDeferred && !this.haStatesReady) await this.initializeHomeAssistantStates();
+      const [, phones] = await Promise.all([this.priorityPhonePlayerId ? Promise.resolve() : this.refreshHaTrackedStates(), this.getHaCompanionPlayers()]);
+      return [...this.haPlayers(), ...phones] as T;
+    }
+    if (command === "players/get") {
+      const playerId = String(args?.player_id || "");
+      if (!playerId.startsWith("media_player.")) return await this.getHaCompanionPlayer(playerId) as T;
       await this.refreshHaTrackedStates();
-      return this.haPlayers() as T;
+      return (this.haPlayers().find(player => player.player_id === args?.player_id) ?? null) as T;
+    }
+    if (command === "player_queues/get") {
+      const queueId = String(args?.queue_id || "");
+      if (!queueId.startsWith("media_player.")) {
+        const player = await this.getHaCompanionPlayer(queueId);
+        return (player ? this.haCompanionQueue(await this.haMassCommand(command, args) as PlayerQueue | null) : null) as T;
+      }
+      await this.refreshHaTrackedStates();
+      const state = this.haMediaStates().find(state => state.entity_id === args?.queue_id);
+      return (state ? this.haStateToQueue(state) : null) as T;
     }
     if (command === "player_queues/all") {
-      await this.refreshHaTrackedStates();
-      return (await this.haQueues()) as T;
+      if (!this.priorityPhonePlayerId) {
+        if (this.haInitializationDeferred && !this.haStatesReady) await this.initializeHomeAssistantStates();
+        await this.refreshHaTrackedStates();
+      }
+      const phones = await this.getHaCompanionPlayers();
+      const [queues, nativeQueues] = await Promise.all([
+        this.priorityPhonePlayerId
+          ? Promise.resolve(this.haMediaStates().map(state => this.mergeHaQueueState(state.entity_id, this.haStateToQueue(state))))
+          : this.haQueues(),
+        Promise.all(phones.filter(p => p.available).map(p => this.haMassCommand("player_queues/get", { queue_id: p.player_id }) as Promise<PlayerQueue | null>)),
+      ]);
+      return [...queues, ...nativeQueues.filter((q): q is PlayerQueue => !!q).map(q => this.haCompanionQueue(q))] as T;
+    }
+    if (command.startsWith("player_queues/") && args?.queue_id && !String(args.queue_id).startsWith("media_player.")) {
+      if (!await this.getHaCompanionPlayer(String(args.queue_id))) throw new Error("Waiting for phone audio");
+      const result = await this.haMassCommand(command, args);
+      return (command === "player_queues/items" && Array.isArray(result) ? result.map(item => this.haCompanionItem(item)) : result) as T;
     }
     if (command === "player_queues/items") return (await this.haQueueItems(String(args?.queue_id || ""))) as T;
     if (command === "music/search") return (await this.haSearch(args)) as T;
@@ -592,6 +881,10 @@ export class MassClient {
 
     if (command.startsWith("players/cmd/")) {
       const playerId = String(args?.player_id || "");
+      if (!playerId.startsWith("media_player.")) {
+        if (!await this.getHaCompanionPlayer(playerId)) throw new Error("Waiting for phone audio");
+        return await this.haMassCommand(command, args) as T;
+      }
       const action = command.slice("players/cmd/".length);
       await this.callHaPlayerCommand(playerId, action, args);
       return undefined as T;
@@ -605,6 +898,92 @@ export class MassClient {
     }
 
     throw new Error(`Home Assistant mode does not support ${command}`);
+  }
+
+  private async getHaCompanionPlayers(): Promise<Player[]> {
+    if (!this.haCompanionDiscovery) return [];
+    if (this.haCompanionPlayersInFlight) return this.haCompanionPlayersInFlight;
+    if (this.haCompanionPlayersAt && Date.now() - this.haCompanionPlayersAt < 8_000) return this.haCompanionPlayers;
+    const epoch = this.connectionEpoch;
+    const run = (async () => {
+      try {
+        const ids = [...this.haCompanionPlayerIds];
+        const players = ids.length
+          ? (await Promise.all(ids.map(id => this.haMassCommand("players/get", { player_id: id }) as Promise<Player | null>))).filter((p): p is Player => !!p)
+          : await this.haMassCommand("players/all", { return_unavailable: true, return_disabled: true }) as Player[];
+        if (epoch !== this.connectionEpoch) return [];
+        this.haCompanionPlayers = players.filter(isCompanionPhonePlayer);
+        this.haCompanionPlayers.forEach(p => this.haCompanionPlayerIds.add(p.player_id));
+      } catch {
+        if (epoch !== this.connectionEpoch) return [];
+        // Optional discovery must not break HA-only installations or retain stale readiness.
+        this.haCompanionPlayers = this.haCompanionPlayers.map(p => ({ ...p, available: false }));
+      }
+      this.haCompanionPlayersAt = Date.now();
+      return this.haCompanionPlayers;
+    })();
+    this.haCompanionPlayersInFlight = run;
+    try { return await run; }
+    finally { if (this.haCompanionPlayersInFlight === run) this.haCompanionPlayersInFlight = undefined; }
+  }
+
+  private async getHaCompanionPlayer(playerId: string): Promise<Player | null> {
+    if (!this.haCompanionPlayers.some(p => p.player_id === playerId)) return null;
+    const epoch = this.connectionEpoch;
+    const player = await this.haMassCommand("players/get", { player_id: playerId }) as Player | null;
+    if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed. Try again.");
+    return player?.player_id === playerId && isCompanionPhonePlayer(player) ? player : null;
+  }
+
+  private haCompanionQueue(queue: PlayerQueue | null): PlayerQueue | null {
+    if (!queue) return null;
+    return { ...queue,
+      current_item: queue.current_item ? this.haCompanionItem(queue.current_item) : undefined,
+      next_item: queue.next_item ? this.haCompanionItem(queue.next_item) : undefined };
+  }
+
+  private haCompanionItem(item: QueueItem): QueueItem {
+    const convert = (image?: MassImage): MassImage | undefined => image
+      ? { path: "", provider: "music_assistant", url: imageUrl(REMOTE_ARTWORK_BASE, image, 256) } : undefined;
+    const media = (value?: MediaItem): MediaItem | undefined => value ? { ...value,
+      image: convert(value.image),
+      metadata: value.metadata ? { ...value.metadata, images: value.metadata.images?.map(image => convert(image)!) } : undefined,
+      album: value.album ? { ...value.album, image: convert(value.album.image),
+        metadata: value.album.metadata ? { ...value.album.metadata, images: value.album.metadata.images?.map(image => convert(image)!) } : undefined } : undefined,
+    } : undefined;
+    return { ...item, image: convert(item.image), media_item: media(item.media_item) };
+  }
+
+  private async fetchHaCompanionArtwork(path: string): Promise<Blob> {
+    const requested = new URL(path, REMOTE_ARTWORK_BASE);
+    const haPicture = /^\/ha-media-player-proxy\/(media_player\.[a-z0-9_]+)$/.exec(requested.pathname);
+    const sxmPicture = requested.pathname === "/siriusxm-artwork" ? siriusXmArtworkUrl(requested.searchParams.get("url") || "") : undefined;
+    if (requested.origin !== REMOTE_ARTWORK_BASE || (!haPicture && !sxmPicture && !/^\/imageproxy(?:\/|$)/.test(requested.pathname)) || requested.hash) {
+      throw new Error("Invalid Music Assistant artwork path");
+    }
+    const epoch = this.connectionEpoch;
+    const assertCurrent = () => { if (epoch !== this.connectionEpoch) throw new Error("Artwork connection replaced"); };
+    const ingress = haPicture || sxmPicture ? undefined : await this.ensureHaIngress();
+    assertCurrent();
+    const url = sxmPicture ? new URL(sxmPicture) : haPicture
+      ? new URL(`/api/media_player_proxy/${haPicture[1]}${requested.search}`, this.haBaseUrl)
+      : new URL(`.${requested.pathname}${requested.search}`, new URL(".", ingress!.url));
+    if (!sxmPicture && (url.origin !== new URL(this.haBaseUrl).origin || (!haPicture && !url.pathname.startsWith("/api/hassio_ingress/")))) throw new Error("Invalid Music Assistant artwork route");
+    const bridge = await importBridgeThingClient();
+    try {
+      assertCurrent();
+      const result = await bridge.net.fetch({ request: { url: url.href, method: "GET",
+        headers: ingress ? [{ name: "Cookie", value: `ingress_session=${ingress.session}` }] : [], body: null, timeoutMs: 15_000, redirect: "error",
+      } }, { timeoutMs: 18_000 });
+      assertCurrent();
+      if (!result.ok) throw new Error("Music Assistant artwork request failed");
+      const response = result.response.response;
+      if ((response.status === 401 || response.status === 403) && ingress && this.haIngress === ingress) this.haIngress = undefined;
+      if (response.status !== 200) throw new Error(`Music Assistant artwork failed (${response.status})`);
+      const type = response.headers?.find(header => header.name.toLowerCase() === "content-type")?.value.split(";")[0] || "image/jpeg";
+      if (!type.startsWith("image/")) throw new Error("Music Assistant did not return an image");
+      return new Blob([response.body as BlobPart], { type });
+    } finally { bridge.close(); }
   }
 
   private haPlayers(): Player[] {
@@ -636,18 +1015,22 @@ export class MassClient {
   }
 
   private async discoverHaPlayerEntityIds(): Promise<string[]> {
+    const epoch = this.connectionEpoch;
     try {
       const subscriptionId = this.haSequence + 1;
       const result = await this.haRequestWithPending<unknown>("render_template", { template: HA_MASS_PLAYER_TEMPLATE }, "template");
+      if (epoch !== this.connectionEpoch) throw new Error("Connection replaced");
       void this.haRequest<null>("unsubscribe_events", { subscription: subscriptionId }).catch(() => undefined);
       const entityIds = typeof result === "string" ? JSON.parse(result) as unknown : result;
       if (Array.isArray(entityIds) && entityIds.every((entityId) => typeof entityId === "string")) {
         return entityIds;
       }
     } catch {
+      if (epoch !== this.connectionEpoch) throw new Error("Connection replaced");
       // Fall back to the larger state call on older Home Assistant installs or restricted tokens.
     }
     const states = await this.haRequest<HaState[]>("get_states");
+    if (epoch !== this.connectionEpoch) throw new Error("Connection replaced");
     const mediaStates = states.filter((state) => state.entity_id.startsWith("media_player."));
     const massStates = mediaStates.filter((state) => this.isHaMassMediaState(state));
     const playerStates = massStates.length ? massStates : mediaStates;
@@ -687,7 +1070,7 @@ export class MassClient {
       if (!state || !this.shouldTrackHaState(state)) return;
       this.haStates.set(entityId, state);
       this.emitHaState(state);
-      if (this.haMediaIdentityChanged(previous, state)) void this.emitHydratedHaQueue(entityId);
+      if (!this.priorityPhonePlayerId && this.haMediaIdentityChanged(previous, state)) void this.emitHydratedHaQueue(entityId);
     });
     const removed = Array.isArray(event.r) ? event.r : Object.keys(event.r ?? {});
     removed.forEach((entityId) => {
@@ -746,27 +1129,45 @@ export class MassClient {
     return this.haMassCommand(command, serviceArgs);
   }
 
-  private async haMassCommand(command: string, serviceArgs?: Record<string, unknown>): Promise<unknown> {
-    const feature = command.startsWith("ai_radio/") ? "AI Radio" : "Player groups";
-    if (!this.haIngress || this.haIngress.expires < Date.now()) {
+  private async ensureHaIngress(): Promise<HaIngress> {
+    if (this.haIngress && this.haIngress.expires > Date.now()) return this.haIngress;
+    if (this.haIngressInFlight) return this.haIngressInFlight;
+    const epoch = this.connectionEpoch;
+    const assertCurrent = () => { if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed"); };
+    const flight = (async () => {
       const panels = await this.haRequest<Record<string, { config?: { addon?: string }; title?: string }>>("get_panels");
+      assertCurrent();
       const candidates = Object.values(panels).filter((panel) => panel.config?.addon && /music.?assistant/i.test(`${panel.title} ${panel.config.addon}`));
-      if (candidates.length !== 1) throw new Error(`${feature} needs a single Music Assistant add-on with Home Assistant ingress enabled`);
+      if (candidates.length !== 1) throw new Error("Music Assistant needs a single add-on with Home Assistant ingress enabled");
       const slug = candidates[0].config!.addon!;
       const [info, session] = await Promise.all([
         this.haRequest<{ ingress_url?: string }>("supervisor/api", { endpoint: `/addons/${slug}/info`, method: "get" }),
         this.haRequest<{ session: string }>("supervisor/api", { endpoint: "/ingress/session", method: "post" }),
       ]);
+      assertCurrent();
       if (!info.ingress_url || !session.session) throw new Error("Music Assistant ingress is unavailable");
       const url = new URL(`${info.ingress_url.replace(/\/$/, "")}/api`, this.haBaseUrl);
       if (url.origin !== new URL(this.haBaseUrl).origin || !url.pathname.startsWith("/api/hassio_ingress/")) {
         throw new Error("Invalid Music Assistant ingress route");
       }
       this.haIngress = { url: url.href, session: session.session, expires: Date.now() + 60_000 };
-    }
-    const ingress = this.haIngress;
+      return this.haIngress;
+    })();
+    this.haIngressInFlight = flight;
+    try { return await flight; }
+    finally { if (this.haIngressInFlight === flight) this.haIngressInFlight = undefined; }
+  }
+
+  private async haMassCommand(command: string, serviceArgs?: Record<string, unknown>): Promise<unknown> {
+    const feature = command.startsWith("ai_radio/") ? "AI Radio"
+      : /(?:set_members|ungroup|create_group_player)$/.test(command) ? "Player groups" : "Music Assistant";
+    const epoch = this.connectionEpoch;
+    const assertCurrent = () => { if (epoch !== this.connectionEpoch) throw new Error("Music Assistant connection changed"); };
+    const ingress = await this.ensureHaIngress();
+    assertCurrent();
     const bridge = await importBridgeThingClient();
     try {
+      assertCurrent();
       const result = await bridge.net.fetch({ request: {
         url: ingress.url,
         method: "POST",
@@ -778,10 +1179,12 @@ export class MassClient {
         timeoutMs: 25_000,
         redirect: "error",
       } }, { timeoutMs: 30_000 });
+      assertCurrent();
       if (!result.ok) throw new Error(`${feature} request failed through the BridgeThing companion`);
+      this.recordServerResponse();
       const response = result.response.response;
       if (response.status < 200 || response.status >= 300) {
-        if (response.status === 401 || response.status === 403) this.haIngress = undefined;
+        if ((response.status === 401 || response.status === 403) && this.haIngress === ingress) this.haIngress = undefined;
         throw new Error(response.status === 400 || response.status === 404
           ? `${feature} command was rejected by Music Assistant. Refresh and try again.`
           : `${feature} request failed (${response.status})`);
@@ -1156,7 +1559,10 @@ export class MassClient {
     const attributes = state.attributes;
     const title = attributes.media_title || attributes.friendly_name;
     if (!title) return undefined;
-    const image = this.haEntityImage(attributes.entity_picture);
+    const sxmPicture = siriusXmArtworkUrl(attributes.entity_picture);
+    const image = sxmPicture
+      ? { url: `${REMOTE_ARTWORK_BASE}/siriusxm-artwork?url=${encodeURIComponent(sxmPicture)}`, path: "", provider: "siriusxm" }
+      : this.haEntityImage(attributes.entity_picture_local || attributes.entity_picture);
     const media: MediaItem = {
       uri: attributes.media_content_id || state.entity_id,
       item_id: attributes.media_content_id || state.entity_id,
@@ -1197,12 +1603,22 @@ export class MassClient {
       previousAttributes.media_content_id !== nextAttributes.media_content_id ||
       previousAttributes.media_content_type !== nextAttributes.media_content_type ||
       previousAttributes.media_duration !== nextAttributes.media_duration ||
-      previousAttributes.entity_picture !== nextAttributes.entity_picture
+      previousAttributes.entity_picture !== nextAttributes.entity_picture ||
+      previousAttributes.entity_picture_local !== nextAttributes.entity_picture_local
     );
   }
 
   private haEntityImage(path?: string): MassImage | undefined {
     if (!path) return undefined;
+    if (this.haBaseUrl) {
+      try {
+        const url = new URL(path, this.haBaseUrl);
+        const picture = /^\/api\/media_player_proxy\/(media_player\.[a-z0-9_]+)$/.exec(url.pathname);
+        if (url.origin === new URL(this.haBaseUrl).origin && picture) {
+          return { url: `${REMOTE_ARTWORK_BASE}/ha-media-player-proxy/${picture[1]}${url.search}`, path: "", provider: "home_assistant" };
+        }
+      } catch { return undefined; }
+    }
     if (/^https?:\/\//.test(path)) return { url: path, path: "", provider: "home_assistant" };
     return { url: `${this.haBaseUrl}${path.startsWith("/") ? "" : "/"}${path}`, path: "", provider: "home_assistant" };
   }
@@ -1221,6 +1637,7 @@ type HaConfigEntry = {
 };
 
 type HaMediaAttributes = {
+  entity_picture_local?: string;
   friendly_name?: string;
   volume_level?: number;
   is_volume_muted?: boolean;
@@ -1243,6 +1660,7 @@ type HaMessage =
   | { type: "auth_required"; ha_version?: string }
   | { type: "auth_ok"; ha_version?: string }
   | { type: "auth_invalid"; message?: string }
+  | { type: "pong"; id: number }
   | HaResultMessage
   | HaEventMessage;
 
@@ -1307,6 +1725,27 @@ function createBridgeThingSocket(
   let removeMessage: (() => void) | undefined;
   let removeClosed: (() => void) | undefined;
   let removeError: (() => void) | undefined;
+  let opening = false;
+  let openRequested = false;
+  let cleanup: Promise<void> | undefined;
+
+  const detach = () => {
+    removeMessage?.();
+    removeClosed?.();
+    removeError?.();
+    sendQueue.length = 0;
+  };
+  const closeRemote = (): Promise<void> => {
+    if (cleanup) return cleanup;
+    const owner = client;
+    cleanup = (async () => {
+      try {
+        if (owner && openRequested) await owner.net.wsClose({ connectionId, code: 1000, reason: "client closed" });
+      } catch { /* The phone may already be out of range. */ }
+      finally { owner?.close(); }
+    })();
+    return cleanup;
+  };
 
   const sendFrame = (data: string) => {
     if (!client || !open || closed) return;
@@ -1318,8 +1757,9 @@ function createBridgeThingSocket(
 
   const ready = (async () => {
     client = await importBridgeThingClient();
+    if (closed) { await closeRemote(); return; }
     removeMessage = client.net.onWsMessage((message) => {
-      if (message.connectionId !== connectionId || message.frame.type !== "text") return;
+      if (closed || message.connectionId !== connectionId || message.frame.type !== "text") return;
       onMessage(message.frame.data);
     });
     removeClosed = client.net.onWsClosed((message) => {
@@ -1333,10 +1773,16 @@ function createBridgeThingSocket(
       if (!closed) onClose();
     });
 
-    const result = await client.net.wsOpen(
-      { connectionId, url, protocols: null, headers: null },
-      { timeoutMs: 12_000 },
-    );
+    openRequested = true;
+    opening = true;
+    let result;
+    try {
+      result = await client.net.wsOpen(
+        { connectionId, url, protocols: null, headers: null },
+        { timeoutMs: 12_000 },
+      );
+    } finally { opening = false; }
+    if (closed) { await closeRemote(); return; }
     if (!result.ok) {
       const detail =
         result.kind === "domain"
@@ -1346,13 +1792,11 @@ function createBridgeThingSocket(
     }
     open = true;
     while (sendQueue.length) sendFrame(sendQueue.shift()!);
-  })().catch((error) => {
+  })().catch(async (error) => {
     closed = true;
     open = false;
-    removeMessage?.();
-    removeClosed?.();
-    removeError?.();
-    client?.close();
+    detach();
+    await closeRemote();
     throw error;
   });
 
@@ -1371,13 +1815,9 @@ function createBridgeThingSocket(
       if (closed) return;
       closed = true;
       open = false;
-      removeMessage?.();
-      removeClosed?.();
-      removeError?.();
-      if (!client) return;
-      void client.net.wsClose({ connectionId, code: 1000, reason: "client closed" }).finally(() => {
-        client?.close();
-      });
+      detach();
+      // Let an in-flight open settle before closing its remote socket and SDK owner.
+      if (client && !opening) void closeRemote();
     },
   };
   return socket;

@@ -2,12 +2,12 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import {
   Album,
   ArrowLeft,
-  Bluetooth,
   CircleAlert,
   Disc3,
   Heart,
   Home,
   ListMusic,
+  Link2,
   LoaderCircle,
   Maximize2,
   Minimize2,
@@ -26,7 +26,6 @@ import {
   Speaker,
   Sun,
   Trash2,
-  Usb,
   Volume2,
 } from "lucide-react";
 import { useHardware } from "./hooks/useHardware";
@@ -45,15 +44,18 @@ import {
   subscribeBridgeThingVoice,
 } from "./lib/bridgething";
 import { imageUrl, itemImage } from "./lib/images";
-import { MassClient } from "./lib/MassClient";
+import { MassClient, type PlaybackSnapshot } from "./lib/MassClient";
 import { connectionTarget, connectionTimings, normalizeRemoteId, validateConnection } from "./lib/connection";
+import { connectionNeedsReconnect, recoverAfterGatewayAttempt, sameConnection, ServerHealthGuard, shouldRecoverGateway, shouldReloadBridgeApp, shouldWaitForGateway } from "./lib/connectionRecovery";
 import { REMOTE_ARTWORK_BASE, useArtworkUrl } from "./lib/remoteArtwork";
 import { fetchLibraryPage, LibraryCache, libraryKey, type LibraryKind } from "./lib/library";
-import { currentPlayer, nextPlayerId } from "./lib/phonePlayer";
+import { currentPlayer, isCompanionPhonePlayer, nextPlayerId, phoneStartupTarget } from "./lib/phonePlayer";
+import { StartupTrace } from "./lib/startupDiagnostics";
 import type { VolumeControl } from "./lib/playerVolume";
 import {
   loadBrightnessPreference,
   loadConfig,
+  loadCompanionPhoneId,
   loadDisplaySize,
   loadNowPlayingTextSize,
   loadPlayerId,
@@ -61,6 +63,7 @@ import {
   loadPresets,
   saveBrightnessPreference,
   saveConfig,
+  saveCompanionPhoneId,
   saveDisplaySize,
   saveNowPlayingTextSize,
   savePlayerId,
@@ -90,7 +93,6 @@ type PlayMediaOptions = {
 };
 const VOLUME_OVERLAY_HIDE_MS = 3_000;
 const PLAYING_POSITION_FRESH_MS = 15_000;
-const BRIDGETHING_RELOAD_AFTER_STALE_MS = 75_000;
 const SIDE_BY_SIDE_PATH = "/music-assistant";
 const AUTO_RELOAD_STORAGE_KEY = "carthing-ma-last-auto-reload";
 const VOICE_COMMAND_FRESH_MS = 12_000;
@@ -357,9 +359,16 @@ export default function App() {
   const reconnectFailures = useRef(0);
   const hadSuccessfulConnection = useRef(false);
   const connectInFlight = useRef<Promise<void> | undefined>(undefined);
-  const coreRefreshInFlight = useRef(false);
+  const coreRefreshInFlight = useRef<{ generation: number; result: Promise<void> } | undefined>(undefined);
+  const serverHealth = useRef(new ServerHealthGuard());
+  const healthCheckInFlight = useRef<number | undefined>(undefined);
+  const waitingForGateway = useRef(false);
   const lastSuccessfulContact = useRef(Date.now());
+  const lastResponseRevision = useRef(0);
   const lastBluetoothReconnect = useRef(0);
+  const gatewayConnected = useRef<boolean | undefined>(undefined);
+  const startupTrace = useRef<StartupTrace | null>(null);
+  if (!startupTrace.current) startupTrace.current = new StartupTrace();
   const connectionStateRef = useRef<ConnectionState>("idle");
   const connectionStateChangedAt = useRef(Date.now());
   const configRef = useRef(config);
@@ -385,8 +394,11 @@ export default function App() {
   }, []);
 
   const markConnectionHealthy = useCallback(() => {
-    lastSuccessfulContact.current = Date.now();
-  }, []);
+    if (!client.lastResponseAt || client.responseRevision === lastResponseRevision.current) return;
+    lastSuccessfulContact.current = client.lastResponseAt;
+    lastResponseRevision.current = client.responseRevision;
+    serverHealth.current.recordSuccess(client.connectionGeneration);
+  }, [client]);
 
   useEffect(() => {
     connectionStateRef.current = connection;
@@ -426,11 +438,9 @@ export default function App() {
     };
   }, [sideBySide]);
 
-  const refreshCore = useCallback(async () => {
-    const [nextPlayers, nextQueues] = await Promise.all([
-      client.command<Player[]>("players/all"),
-      client.command<PlayerQueue[]>("player_queues/all"),
-    ]);
+  const applyCoreSnapshot = useCallback(({ players: nextPlayers, queues: nextQueues }: PlaybackSnapshot) => {
+    const phone = nextPlayers.find(player => player.player_id === loadPhoneVolumePlayerId() && isCompanionPhonePlayer(player));
+    if (phone && loadCompanionPhoneId() !== phone.player_id) saveCompanionPhoneId(phone.player_id);
     markConnectionHealthy();
     const visiblePlayers = nextPlayers.filter((player) => player.available);
     setPlayers(visiblePlayers);
@@ -440,7 +450,28 @@ export default function App() {
       if (selected) savePlayerId(selected);
       return selected;
     });
-  }, [client, markConnectionHealthy]);
+  }, [markConnectionHealthy]);
+
+  const refreshCore = useCallback(async () => {
+    const generation = client.connectionGeneration;
+    if (coreRefreshInFlight.current?.generation === generation) return coreRefreshInFlight.current.result;
+    const result = (async () => {
+      const phone = loadPhoneVolumePlayerId();
+      if (phone) client.enablePhonePlayerDiscovery(phone);
+      client.prioritizePhonePlayer(phoneStartupTarget(configRef.current, loadPlayerId(), phone, loadCompanionPhoneId()));
+      const [players, queues] = await Promise.all([
+        client.command<Player[]>("players/all"),
+        client.command<PlayerQueue[]>("player_queues/all"),
+      ]);
+      if (generation !== client.connectionGeneration) throw new Error("Music Assistant connection changed");
+      applyCoreSnapshot({ players, queues });
+    })();
+    const flight = { generation, result };
+    coreRefreshInFlight.current = flight;
+    const clear = () => { if (coreRefreshInFlight.current === flight) coreRefreshInFlight.current = undefined; };
+    void result.then(clear, clear);
+    return result;
+  }, [client, applyCoreSnapshot]);
 
   const connect = useCallback(
     async (nextConfig = config, credentials?: { username: string; password: string }) => {
@@ -450,14 +481,27 @@ export default function App() {
         setView("settings");
         return;
       }
+      if (shouldWaitForGateway(nextConfig, isBridgeThingRuntime(sideBySide), gatewayConnected.current)) {
+        if (!waitingForGateway.current) startupTrace.current!.mark("waiting_for_gateway");
+        waitingForGateway.current = true;
+        connectionStateRef.current = "error";
+        setConnection("error");
+        setError("Waiting for phone connection...");
+        return;
+      }
+      waitingForGateway.current = false;
       clearTimeout(reconnectTimer.current);
+      connectionStateRef.current = "connecting";
       setConnection("connecting");
       setError("");
+      const attempt = startupTrace.current!.startAttempt();
       try {
         await client.connect(
           connectionTarget(nextConfig),
           credentials?.username ? undefined : nextConfig.token,
           nextConfig.transport ?? "direct",
+          { startupPhonePlayerId: phoneStartupTarget(nextConfig, loadPlayerId(), loadPhoneVolumePlayerId(), loadCompanionPhoneId()),
+            onStartupPhase: phase => startupTrace.current!.mark(phase, attempt) },
         );
         let resolvedConfig = nextConfig;
         if (credentials?.username) {
@@ -466,15 +510,22 @@ export default function App() {
           setConfig(resolvedConfig);
           saveConfig(resolvedConfig);
         }
-        await refreshCore();
+        const initial = client.takeStartupSnapshot();
+        if (initial) applyCoreSnapshot(initial);
+        else await refreshCore();
         markConnectionHealthy();
+        connectionStateRef.current = "connected";
         setConnection("connected");
         hadSuccessfulConnection.current = true;
         reconnectFailures.current = 0;
         setConfig(resolvedConfig);
         saveConfig(resolvedConfig);
+        startupTrace.current!.mark("screen_ready", attempt);
       } catch (reason) {
+        startupTrace.current!.mark("connection_failed", attempt);
+        client.disconnect();
         reconnectFailures.current += 1;
+        connectionStateRef.current = "error";
         setConnection("error");
         setError(reason instanceof Error ? reason.message : String(reason));
         if (
@@ -498,30 +549,63 @@ export default function App() {
         if (connectInFlight.current === run) connectInFlight.current = undefined;
       }
     },
-    [client, config, markConnectionHealthy, refreshCore, sideBySide],
+    [client, config, markConnectionHealthy, refreshCore, applyCoreSnapshot, sideBySide],
   );
 
   const scheduleReconnect = useCallback(
     (delay = 2_000) => {
       window.clearTimeout(reconnectTimer.current);
       reconnectTimer.current = window.setTimeout(() => {
+        if (connectionStateRef.current === "connected" && client.isConnected()) return;
         const nextConfig = configRef.current;
         if (connectionTarget(nextConfig)) void connect(nextConfig);
       }, delay);
     },
-    [connect],
+    [client, connect],
   );
 
   const forceReconnect = useCallback(
     (delay = 750) => {
       const nextConfig = configRef.current;
       if (!connectionTarget(nextConfig)) return;
+      startupTrace.current!.mark("reconnect_requested");
       client.disconnect();
+      if (connectionStateRef.current !== "idle") connectionStateRef.current = "error";
       setConnection((current) => (current === "idle" ? current : "error"));
       scheduleReconnect(delay);
     },
     [client, scheduleReconnect],
   );
+
+  const verifyServerConnection = useCallback(async () => {
+    if (connectionStateRef.current !== "connected" || connectInFlight.current) return;
+    const generation = client.connectionGeneration;
+    if (healthCheckInFlight.current === generation) return;
+    if (!client.isConnected()) {
+      startupTrace.current!.mark("socket_closed");
+      forceReconnect();
+      return;
+    }
+    healthCheckInFlight.current = generation;
+    try {
+      markConnectionHealthy();
+      const verdict = await serverHealth.current.verify(generation, async () => {
+        const healthy = await client.probeConnection();
+        markConnectionHealthy();
+        return healthy;
+      });
+      if (generation !== client.connectionGeneration || connectionStateRef.current !== "connected") return;
+      if (verdict === "healthy") {
+        startupTrace.current!.mark("server_probe_ok");
+        markConnectionHealthy();
+      } else if (verdict !== "superseded") {
+        startupTrace.current!.mark("server_probe_failed");
+        if (verdict === "dead") forceReconnect();
+      }
+    } finally {
+      if (healthCheckInFlight.current === generation) healthCheckInFlight.current = undefined;
+    }
+  }, [client, forceReconnect, markConnectionHealthy]);
 
   const ensureConnected = useCallback(async () => {
     if (connectionStateRef.current === "connected" && client.isConnected()) return true;
@@ -533,7 +617,7 @@ export default function App() {
     }
     showNotice("Reconnecting to Music Assistant...");
     await connect(nextConfig);
-    return client.isConnected();
+    return connectionStateRef.current === "connected" && client.isConnected();
   }, [client, connect, showNotice]);
 
   useEffect(() => {
@@ -621,10 +705,22 @@ export default function App() {
               }
             : {}),
         };
+        if (sameConnection(current, next)) return current;
+        configRef.current = next;
         saveConfig(next);
+        if (!connectionNeedsReconnect(current, next)) return next;
+        startupTrace.current!.mark("settings_changed");
         window.clearTimeout(configReconnectTimer.current);
         if (connectionTarget(next)) {
-          configReconnectTimer.current = window.setTimeout(() => void connect(next), 750);
+          configReconnectTimer.current = window.setTimeout(() => {
+            void (async () => {
+              if (connectInFlight.current) {
+                client.disconnect();
+                await connectInFlight.current;
+              }
+              if (!cancelled) await connect(configRef.current);
+            })();
+          }, 750);
         }
         return next;
       });
@@ -666,9 +762,14 @@ export default function App() {
           ),
         );
       }
-      if (event.event === "player_added" || event.event === "player_removed") void refreshCore();
+      if (event.event === "player_added" || event.event === "player_removed") void refreshCore().catch(() => {
+        startupTrace.current!.mark("refresh_failed");
+      });
     });
     const removeClose = client.onClose(() => {
+      startupTrace.current!.mark("socket_closed");
+      setError("Music Assistant disconnected. Reconnecting automatically...");
+      connectionStateRef.current = "error";
       setConnection((current) => {
         if (current === "connected") scheduleReconnect();
         return current === "idle" ? current : "error";
@@ -749,9 +850,9 @@ export default function App() {
 	  useEffect(() => {
 	    if (connection === "error") {
 	      const localRelay = isLocalRelayUrl(config.serverUrl);
-	      const bridgeRuntime = isBridgeThingRuntime(sideBySide);
 	      const retryDelay = localRelay ? 4_000 : 8_000;
       reconnectTimer.current = window.setTimeout(() => {
+        if (connectionStateRef.current === "connected" && client.isConnected()) return;
         const nextConfig = configRef.current;
         if (connectionTarget(nextConfig)) void connect(nextConfig);
       }, localRelay ? 2_000 : 5_000);
@@ -760,15 +861,15 @@ export default function App() {
         const nextConfig = configRef.current;
         if (connectionTarget(nextConfig)) void connect(nextConfig);
       }, retryDelay);
-	      const reload = (localRelay && sideBySide) || (bridgeRuntime && hadSuccessfulConnection.current)
+	      const reload = localRelay && sideBySide
 	        ? window.setTimeout(() => {
 	            const lastReload = Number(window.sessionStorage.getItem(AUTO_RELOAD_STORAGE_KEY) || "0");
-	            const reloadAfter = localRelay ? 45_000 : BRIDGETHING_RELOAD_AFTER_STALE_MS;
+	            const reloadAfter = 45_000;
 	            if (Date.now() - lastReload > reloadAfter) {
 	              window.sessionStorage.setItem(AUTO_RELOAD_STORAGE_KEY, String(Date.now()));
 	              window.location.reload();
 	            }
-	          }, localRelay ? 18_000 : BRIDGETHING_RELOAD_AFTER_STALE_MS)
+	          }, 18_000)
 	        : undefined;
       return () => {
         clearTimeout(reconnectTimer.current);
@@ -777,36 +878,36 @@ export default function App() {
       };
     }
     return () => clearTimeout(reconnectTimer.current);
-  }, [connection, connect, config, sideBySide]);
+  }, [client, connection, connect, config, sideBySide]);
 
   useEffect(() => {
     if (connection !== "connected") return;
     const interval = window.setInterval(() => {
+      markConnectionHealthy();
       const staleFor = Date.now() - lastSuccessfulContact.current;
+      if (staleFor > staleMs) void verifyServerConnection();
       if (volumeControl) {
-        if (!client.isConnected() || staleFor > staleMs) forceReconnect();
+        if (!client.isConnected() || staleFor > staleMs) void verifyServerConnection();
         return;
       }
-      if (coreRefreshInFlight.current) {
-        if (staleFor > staleMs) forceReconnect();
+      if (coreRefreshInFlight.current?.generation === client.connectionGeneration) {
+        if (staleFor > staleMs) void verifyServerConnection();
         return;
       }
       if (!client.isConnected()) {
-        forceReconnect();
+        void verifyServerConnection();
         return;
       }
-      coreRefreshInFlight.current = true;
+      const generation = client.connectionGeneration;
       void refreshCore()
-        .catch((reason) => {
-          setError(reason instanceof Error ? reason.message : String(reason));
-          forceReconnect();
-        })
-        .finally(() => {
-          coreRefreshInFlight.current = false;
+        .catch(() => {
+          if (generation !== client.connectionGeneration) return;
+          startupTrace.current!.mark("refresh_failed");
+          void verifyServerConnection();
         });
     }, refreshMs);
     return () => window.clearInterval(interval);
-  }, [client, connection, forceReconnect, refreshCore, refreshMs, staleMs, volumeControl]);
+  }, [client, connection, markConnectionHealthy, verifyServerConnection, refreshCore, refreshMs, staleMs, volumeControl]);
 
   useEffect(() => {
     const reconnectIfNeeded = () => {
@@ -815,11 +916,13 @@ export default function App() {
       const staleFor = Date.now() - lastSuccessfulContact.current;
       if (connectionStateRef.current === "connected" && client.isConnected()) {
         if (staleFor > staleMs) {
-          forceReconnect(250);
-          return;
+          void verifyServerConnection();
         }
+        const generation = client.connectionGeneration;
         void refreshCore().catch(() => {
-          forceReconnect(750);
+          if (generation !== client.connectionGeneration) return;
+          startupTrace.current!.mark("refresh_failed");
+          void verifyServerConnection();
         });
         return;
       }
@@ -838,25 +941,46 @@ export default function App() {
       window.removeEventListener("pageshow", reconnectIfNeeded);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [client, forceReconnect, refreshCore, scheduleReconnect, staleMs]);
+  }, [client, verifyServerConnection, refreshCore, scheduleReconnect, staleMs]);
 
   useEffect(() => {
     if (!isBridgeThingRuntime(sideBySide)) return;
     let unsubscribeBluetooth: (() => void) | undefined;
     let cancelled = false;
     void subscribeBridgeThingBluetooth((connected) => {
+      const previous = gatewayConnected.current;
+      gatewayConnected.current = connected;
+      if (previous !== connected) startupTrace.current!.mark(connected ? "gateway_connected" : "gateway_disconnected");
       const nextConfig = configRef.current;
-      if (!connectionTarget(nextConfig)) return;
+      if (!connectionTarget(nextConfig) || !nextConfig.transport || nextConfig.transport === "direct") return;
       if (connected) {
+        const flight = connectInFlight.current;
+        if (previous === false && flight) {
+          // Keep a live handshake intact; retry promptly only if that attempt fails.
+          recoverAfterGatewayAttempt(flight, () => {
+            if (cancelled || gatewayConnected.current !== true || connectInFlight.current) return false;
+            const staleFor = Date.now() - lastSuccessfulContact.current;
+            return shouldRecoverGateway(connectionStateRef.current, client.isConnected(), false, staleFor, staleMs) &&
+              !(connectionStateRef.current === "connected" && client.isConnected());
+          }, () => forceReconnect(250));
+          return;
+        }
         const now = Date.now();
         const staleFor = now - lastSuccessfulContact.current;
-        if (connectionStateRef.current === "connected" && client.isConnected() && staleFor < staleMs) return;
+        if (connectionStateRef.current === "connected" && client.isConnected()) {
+          if (staleFor > staleMs) void verifyServerConnection();
+          return;
+        }
+        if (!shouldRecoverGateway(connectionStateRef.current, client.isConnected(), !!connectInFlight.current, staleFor, staleMs)) return;
         if (now - lastBluetoothReconnect.current < 10_000) return;
         lastBluetoothReconnect.current = now;
-        forceReconnect(1_000);
+        forceReconnect(250);
         return;
       }
+      if (previous === false) return;
       client.disconnect();
+      setError("Phone disconnected. Reconnecting automatically...");
+      connectionStateRef.current = "error";
       setConnection((current) => (current === "idle" ? current : "error"));
     })
       .then((unsubscribe) => {
@@ -870,7 +994,23 @@ export default function App() {
       cancelled = true;
       unsubscribeBluetooth?.();
     };
-  }, [client, forceReconnect, sideBySide, staleMs]);
+  }, [client, forceReconnect, verifyServerConnection, sideBySide, staleMs]);
+
+  useEffect(() => {
+    if (!isBridgeThingRuntime(sideBySide)) return;
+    // Retry state transitions must not restart the overall recovery deadline.
+    const watchdog = window.setInterval(() => {
+      if (!configRef.current.transport || configRef.current.transport === "direct") return;
+      const now = Date.now();
+      const lastReload = Number(window.sessionStorage.getItem(AUTO_RELOAD_STORAGE_KEY) || "0");
+      if (!shouldReloadBridgeApp({ now, lastReload, lastHealthy: lastSuccessfulContact.current,
+        gatewayConnected: gatewayConnected.current === true, configured: !!connectionTarget(configRef.current),
+        state: connectionStateRef.current, editingSettings: view === "settings" })) return;
+      window.sessionStorage.setItem(AUTO_RELOAD_STORAGE_KEY, String(now));
+      window.location.reload();
+    }, 10_000);
+    return () => window.clearInterval(watchdog);
+  }, [sideBySide, view]);
 
   useEffect(() => {
     if (!sideBySide || !isLocalRelayUrl(config.serverUrl)) return;
@@ -1109,10 +1249,7 @@ export default function App() {
         if (!(await ensureConnected())) return;
         const primaryMedia = Array.isArray(media) ? media[0] : media;
         if (!primaryMedia) return showNotice("No playable items found");
-        const targetQueue =
-          queues.find((queue) => queue.queue_id === targetPlayer.player_id) ??
-          queues.find((queue) => queue.queue_id === targetPlayer.active_source);
-        const queueId = targetQueue?.queue_id || targetPlayer.player_id;
+        const { player: freshPlayer, queueId } = await client.getPlaybackTarget(targetPlayer.player_id, loadPhoneVolumePlayerId());
         const mediaType = "media_type" in primaryMedia ? primaryMedia.media_type : primaryMedia.mediaType;
         if (mediaType === "ai_radio") {
           if (aiRadioStarting.current) return;
@@ -1121,14 +1258,14 @@ export default function App() {
           const status = await client.command<{ sessions: Array<{ session_id: string; status: string }> }>("ai_radio/status");
           const running = status.sessions.filter((session) => session.status === "running");
           if (running.length && !options.replaceAiRadio) {
-            setAiRadioSwitch({ media: primaryMedia, player: targetPlayer });
+            setAiRadioSwitch({ media: primaryMedia, player: freshPlayer });
             return;
           }
           for (const session of running) await client.command("ai_radio/stop", { session_id: session.session_id });
           showNotice(`Starting ${primaryMedia.name}...`);
           await client.command("ai_radio/start", {
             station_id: decodeURIComponent(primaryMedia.uri.split("/show/")[1] || ""),
-            player_id_override: targetPlayer.player_id,
+            player_id_override: freshPlayer.player_id,
           });
         } else await client.command("player_queues/play_media", {
           queue_id: queueId,
@@ -1154,7 +1291,7 @@ export default function App() {
         if (startingAiRadio) aiRadioStarting.current = false;
       }
     },
-    [client, ensureConnected, queues, refreshCore, showNotice],
+    [client, ensureConnected, refreshCore, showNotice],
   );
 
   const playMedia = useCallback(
@@ -1662,9 +1799,9 @@ function VolumeOverlay({ volume }: { volume: number }) {
 
 function ConnectionBadge({ state }: { state: ConnectionState }) {
   return (
-    <div className={`connection ${state}`} title={state}>
-      {state === "connecting" ? <LoaderCircle className="spin" size={15} /> : state === "connected" ? <Usb size={15} /> : <Bluetooth size={15} />}
-      <span>{state === "connected" ? "ON" : state}</span>
+    <div className={`connection ${state}`} title={`Music Assistant: ${state}`}>
+      {state === "connecting" ? <LoaderCircle className="spin" size={15} /> : state === "connected" ? <Link2 size={15} /> : <CircleAlert size={15} />}
+      <span>{state === "connected" ? "ON" : state === "error" ? "MA error" : state}</span>
     </div>
   );
 }

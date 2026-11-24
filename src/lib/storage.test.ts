@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   loadBrightnessPreference,
   loadConfig,
+  loadCompanionPhoneId,
   loadNowPlayingTextSize,
   loadPlayerId,
   loadPresets,
   saveBrightnessPreference,
   saveConfig,
+  saveCompanionPhoneId,
   saveNowPlayingTextSize,
   savePlayerId,
   savePresets,
@@ -25,6 +27,16 @@ describe("device-local settings", () => {
     savePresets([{ slot: 1, uri: "library://playlist/1", name: "Morning", mediaType: "playlist" }]);
     expect(loadPlayerId()).toBe("sonos-kitchen");
     expect(loadPresets()[0]?.name).toBe("Morning");
+  });
+
+  it("remembers verified companion identity without changing connection settings or selection", () => {
+    saveConfig({ serverUrl: "https://example.com", transport: "homeassistant", token: "test-token" });
+    savePlayerId("home-speaker");
+    expect(loadCompanionPhoneId()).toBe("");
+    saveCompanionPhoneId("verified-phone");
+    expect(loadCompanionPhoneId()).toBe("verified-phone");
+    expect(loadPlayerId()).toBe("home-speaker");
+    expect(loadConfig()).toEqual({ serverUrl: "https://example.com", transport: "homeassistant", token: "test-token" });
   });
 
   it("persists the Now Playing text size", () => {

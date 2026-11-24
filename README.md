@@ -10,7 +10,13 @@
 
 A Music Assistant controller for Spotify Car Thing running BridgeThing.
 
-**Latest release: 0.1.7.** [What's changed and upgrade notes](docs/releases/v0.1.7.md).
+**Latest stable release: 0.1.7.** [Stable upgrade notes](docs/releases/v0.1.7.md).
+
+**Opt-in beta: 0.1.8-beta.1**, with the optional **CarThing Phone Player
+0.2.0-beta.1** Android APK. [Beta downloads](https://github.com/nwo122383/MusicAssistant_Bridgething/releases/tag/v0.1.8-beta.1)
+and [beta setup, changes, and known limitations](docs/releases/v0.1.8-beta.1.md).
+The normal BridgeThing store source stays on stable 0.1.7; updating the source
+does not opt you into this beta.
 
 ## Requirements
 
@@ -48,7 +54,7 @@ interchangeable:
 | Connection Path | Address | Authentication |
 | --- | --- | --- |
 | Music Assistant WebRTC | MA Remote ID | MA username/password after connecting, or an existing MA token |
-| Home Assistant / Nabu Casa | Remote HA HTTPS URL | HA long-lived access token |
+| Home Assistant / Nabu Casa | Remote HA HTTPS URL | Beta: Sign in to Home Assistant; advanced HA token supported. Stable 0.1.7: HA long-lived access token |
 | BridgeThing companion network | Reachable MA HTTPS URL | MA access token, or MA login on the Car Thing |
 | Direct browser connection | MA HTTP/HTTPS URL reachable by the Car Thing browser | MA access token, or MA login on the Car Thing |
 
@@ -81,9 +87,15 @@ WebRTC control does not, by itself, register the phone as a speaker.
 
 ### Home Assistant / Nabu Casa
 
-Choose **Home Assistant / Nabu Casa**, enter your remote HA HTTPS URL and a
-**Home Assistant long-lived access token**, then save. An MA token will not work
-for this path.
+In **0.1.8-beta.1**, choose **Home Assistant / Nabu Casa**, enter your remote HA
+HTTPS URL, and press **Sign in to Home Assistant**. Sign in with your HA account
+on HA's own page, then return to BridgeThing. The app saves renewable credentials;
+you do not need to create a token manually. The **Advanced access token** option
+still accepts an HA long-lived token. An MA token will not work for this path.
+
+Stable **0.1.7** still uses a manually supplied HA long-lived access token.
+The browser-login feature requires the beta ZIP, not just a source-code update.
+See [HA sign-in and credential handling](docs/home-assistant-login.md).
 
 AI Radio and group management use MA add-on ingress through the existing HA
 connection. They need HA Supervisor/admin access and an enabled MA ingress panel.
@@ -185,20 +197,35 @@ volume bar follows Android's reported level.
 A selected phone assigned this way is preserved while it reconnects. The app
 waits for it rather than silently playing through a home speaker.
 
-### Optional Android Helper: Experimental
+### Optional Android Helper: Beta
 
-The source in [phone-player](phone-player/README.md) uses MA's standard Android
-media service to activate its native Sendspin player without manually opening
-MA's screen in the intended daily flow. It does not replace BridgeThing, and it
-does not need a second Bluetooth data connection or its own MA credentials.
+The [0.2.0-beta.1 phone player](phone-player/README.md) owns a native Sendspin
+receiver. It does **not** require the official MA Android app, a PC relay, or an
+additional server component. It is a separate Android APK, not part of the
+BridgeThing webapp ZIP, and is unnecessary for controlling home speakers.
 
-It still requires the official MA Android app, initial MA sign-in/local-player
-setup, helper permissions, and Android device association.
+For the beta phone-audio route, use an existing **Home Assistant / Nabu Casa**
+remote HTTPS address and the **Music Assistant app/add-on with HA ingress**.
+Open CarThing Phone Player once, sign in to HA, grant its permissions, select
+your Car Thing, and enable automatic startup. In our Car Thing app, select
+**CarThing Phone** and assign its smartphone volume control. Route the phone's
+normal media output to the car stereo's Bluetooth/AUX adapter.
 
-**Native phone registration and playback are verified; fully automatic
-locked-phone/cold-car startup is not yet verified.** The helper is not included
-in the webapp ZIP, and this release does not publish a helper APK. It is not
-required for controlling existing home speakers.
+The helper and controller each need their own one-time sign-in; they do not
+share private credentials between Android apps. **Native helper MA Remote-ID /
+WebRTC login is not implemented**. The controller's WebRTC option remains
+available, but an MA Remote ID alone does not configure phone audio in this APK.
+
+The intended daily flow is automatic associated-device startup, not opening
+multiple phone screens before each drive. Screen-off playback and stable player
+identity have been tested, but **consistent sub-minute cold startup is not
+established**, and brief audio-buffer gaps remain under investigation. Force
+stopping an app or Android background restrictions can prevent automatic startup.
+Read the [beta limitations and verification](docs/releases/v0.1.8-beta.1.md)
+before relying on this experimental car setup.
+
+Stable 0.1.7 did not publish an APK. Its earlier helper source depended on the
+official MA app; do not mix those instructions with the standalone beta helper.
 
 ## Development
 
@@ -214,6 +241,11 @@ through BridgeThing on their phone. Hardware, phone networking, and reconnect
 behavior need testing on a real Car Thing.
 
 ## Prepare And Publish A Release
+
+For the current beta, run `npm run build:bridgething` and
+`npm run package:bridgething`, then publish the ZIP and optional signed APK in a
+GitHub **prerelease**, without changing the stable catalog or its hosted files.
+The steps below are for a later stable store release.
 
 1. Set the same new version in `package.json` and
    `public/manifest.json`, and update the lockfile.
@@ -258,7 +290,7 @@ Android helper are not bundled.
 - `public/manifest.json`: stable app identity and config declarations.
 - `docs/catalog.v1.json`: public catalog and versioned download metadata.
 - `docs/releases/`: release notes.
-- `phone-player/`: optional experimental Android media-service helper.
+- `phone-player/`: optional native Android Sendspin player and its setup guide.
 - `scripts/`: build/package and older development utilities.
 
 ## Legacy Prototypes

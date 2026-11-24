@@ -25,8 +25,12 @@ describe("phone media volume through BridgeThing", () => {
     expect(nextPlayerId([home], "phone", "phone")).toBe("phone");
     expect(currentPlayer([home], "phone", "phone")).toBeUndefined();
     expect(currentPlayer([home, phone], "phone", "phone")).toBe(phone);
-    expect(nextPlayerId([home], "unknown", "")).toBe("home");
-    expect(nextPlayerId([home], "", "")).toBe("home");
+    expect(nextPlayerId([home], "unknown", "")).toBe("unknown");
+    expect(nextPlayerId([home], "", "")).toBe("");
+    expect(nextPlayerId([home], "", "phone")).toBe("phone");
+    expect(currentPlayer([home], "unknown", "phone")).toBeUndefined();
+    expect(currentPlayer([home], "", "")).toBeUndefined();
+    expect(currentPlayer([{ ...phone, available: false }, home], "phone", "phone")).toBeUndefined();
     expect(currentPlayer([home, phone], "home", "phone")).toBe(home);
   });
   it("uses relative Android volume steps and reports actual levels including zero", async () => {
